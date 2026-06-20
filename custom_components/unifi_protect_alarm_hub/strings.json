@@ -2,6 +2,8 @@
   "config": {
     "step": {
       "user": {
+        "title": "UniFi Protect Alarm Hub",
+        "description": "Enter your UniFi Protect console address and an API key (UniFi OS → Settings → Control Plane → Integrations).",
         "data": {
           "host": "Host",
           "port": "Port",

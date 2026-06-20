@@ -49,3 +49,9 @@ async def test_user_flow_cannot_connect(hass):
     result = await _run(hass, side_effect=AlarmHubConnectionError("down"))
     assert result["type"] == FlowResultType.FORM
     assert result["errors"] == {"base": "cannot_connect"}
+
+
+async def test_user_flow_unknown_error(hass):
+    result = await _run(hass, side_effect=Exception("boom"))
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "unknown"}
