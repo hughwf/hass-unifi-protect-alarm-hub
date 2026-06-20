@@ -17,8 +17,8 @@ PLATFORMS: list[Platform] = [
 DEFAULT_PORT = 443
 DEFAULT_VERIFY_SSL = False
 
-# Safety-net resync; real-time updates arrive via the devices WebSocket.
-SCAN_INTERVAL = timedelta(minutes=5)
+# REST polling is the primary update mechanism for v0.1.
+SCAN_INTERVAL = timedelta(seconds=15)
 
 MANUFACTURER = "Ubiquiti"
 MODEL = "Alarm Hub"
