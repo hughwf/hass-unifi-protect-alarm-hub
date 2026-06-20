@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from uiprotect.data.public_devices import LinkStation
 
 from .const import DOMAIN, MANUFACTURER, MODEL
 from .coordinator import AlarmHubCoordinator
+from .models import AlarmHub
 
 
 class AlarmHubBaseEntity(CoordinatorEntity[AlarmHubCoordinator]):
@@ -28,7 +28,7 @@ class AlarmHubBaseEntity(CoordinatorEntity[AlarmHubCoordinator]):
         )
 
     @property
-    def hub(self) -> LinkStation | None:
+    def hub(self) -> AlarmHub | None:
         """Return the live hub object from the latest coordinator snapshot."""
         return self.coordinator.data.get(self._hub_id)
 
