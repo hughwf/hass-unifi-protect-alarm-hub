@@ -42,8 +42,7 @@ class BatteryStatusSensor(AlarmHubBaseEntity, SensorEntity):
         hub = self.hub
         if hub is None or hub.alarm_hub_battery is None:
             return None
-        status = hub.alarm_hub_battery.battery_status
-        return status.value if status else None
+        return hub.alarm_hub_battery.battery_status
 
 
 class BatteryVoltageSensor(AlarmHubBaseEntity, SensorEntity):

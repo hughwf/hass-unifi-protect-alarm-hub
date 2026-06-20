@@ -78,9 +78,9 @@ class ZoneBinarySensor(_ZoneBase):
         if zone is None:
             return {}
         return {
-            "status": zone.status.value,
-            "contact_type": zone.type.value,
-            "input_type": zone.input_type.value if zone.input_type else None,
+            "status": zone.status,
+            "contact_type": zone.type,
+            "input_type": zone.input_type,
             "last_triggered_at": zone.last_triggered_at,
             "camera_id": zone.camera_id,
         }
