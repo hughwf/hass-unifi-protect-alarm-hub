@@ -9,7 +9,15 @@ layer wraps them.
 
 from __future__ import annotations
 
-from uiprotect.data.public_devices import AlarmHubInput, AlarmHubOutput
+from typing import Any
+
+from uiprotect.data.public_devices import (
+    AlarmHubBattery,
+    AlarmHubCover,
+    AlarmHubInput,
+    AlarmHubOutput,
+    LinkStation,
+)
 from uiprotect.data.types import (
     AlarmHubConnectionState,
     AlarmHubCoverStatus,
@@ -53,31 +61,40 @@ def zone_device_class(zone: AlarmHubInput) -> str:
 
 
 def zone_enabled_default(zone: AlarmHubInput) -> bool:
-    """Whether this zone's entities should be enabled by default."""
+    """Whether this zone's entities should be enabled by default.
+
+    Conservatively returns False for OnOffState.UNKNOWN.
+    """
     return zone.enable == OnOffState.ON
 
 
 def zone_name(zone: AlarmHubInput, zone_id: int) -> str:
+    """Return the zone's configured name, falling back to ``Zone <zone_id>``."""
     return zone.name or f"Zone {zone_id}"
 
 
 def zone_unique_id(mac: str, zone_id: int) -> str:
+    """Build the unique id for a zone's primary binary sensor entity."""
     return f"{mac}_zone_{zone_id}"
 
 
 def zone_fault_unique_id(mac: str, zone_id: int) -> str:
+    """Build the unique id for a zone's wiring-fault binary sensor entity."""
     return f"{mac}_zone_{zone_id}_fault"
 
 
 def output_unique_id(mac: str, output_id: int) -> str:
+    """Build the unique id for an output relay entity."""
     return f"{mac}_output_{output_id}"
 
 
 def output_is_on(output: AlarmHubOutput) -> bool:
+    """True when the output relay is energised (``active == on``)."""
     return output.active == OnOffState.ON
 
 
 def output_name(output: AlarmHubOutput, output_id: int) -> str:
+    """Return the output's configured name, falling back to ``Output <output_id>``."""
     return output.name or f"Output {output_id}"
 
 
@@ -85,18 +102,22 @@ def armed_is_on(armed: OnOffState | None) -> bool:
     return armed == OnOffState.ON
 
 
-def cover_is_on(cover) -> bool:
+def cover_is_on(cover: AlarmHubCover | None) -> bool:
     """True when the tamper cover is open."""
     return cover is not None and cover.status == AlarmHubCoverStatus.OPEN
 
 
-def battery_connected_is_on(battery) -> bool:
+def battery_connected_is_on(battery: AlarmHubBattery | None) -> bool:
     """True when the backup battery is connected."""
     return (
         battery is not None and battery.connection == AlarmHubConnectionState.CONNECTED
     )
 
 
-def snapshot(public_bootstrap) -> dict:
-    """Return a plain ``{hub_id: LinkStation}`` dict of alarm hubs only."""
+def snapshot(public_bootstrap: Any) -> dict[str, LinkStation]:
+    """Return a ``{hub_id: LinkStation}`` copy of the bootstrap's alarm-hub map.
+
+    ``public_bootstrap.alarm_hubs`` is already filtered to alarm hubs by
+    uiprotect, so this is a straight copy.
+    """
     return dict(public_bootstrap.alarm_hubs)

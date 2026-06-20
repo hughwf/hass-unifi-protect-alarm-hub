@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from uiprotect.data.public_devices import AlarmHubInput, AlarmHubOutput, LinkStation
+from uiprotect.data.types import OnOffState
 from custom_components.unifi_protect_alarm_hub import logic
 
 
@@ -33,6 +34,7 @@ def test_zone_device_class_mapping():
     assert logic.zone_device_class(_zone(input_type="SMOKE")) == "smoke"
     assert logic.zone_device_class(_zone(input_type="GLASS_BREAK")) == "sound"
     assert logic.zone_device_class(_zone(input_type="EMERGENCY_BUTTON")) == "safety"
+    assert logic.zone_device_class(_zone(input_type="unknown")) == "safety"
 
 
 def test_zone_device_class_defaults_to_safety():
@@ -110,14 +112,18 @@ def _hub() -> LinkStation:
 
 def test_armed_is_on():
     assert logic.armed_is_on(_hub().alarm_hub_armed) is True
+    assert logic.armed_is_on(OnOffState.OFF) is False
+    assert logic.armed_is_on(None) is False
 
 
 def test_cover_is_on_when_open():
     assert logic.cover_is_on(_hub().alarm_hub_cover) is True
+    assert logic.cover_is_on(None) is False
 
 
 def test_battery_connected_is_on():
     assert logic.battery_connected_is_on(_hub().alarm_hub_battery) is True
+    assert logic.battery_connected_is_on(None) is False
 
 
 def test_snapshot_extracts_only_alarm_hubs():
