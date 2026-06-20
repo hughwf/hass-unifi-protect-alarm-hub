@@ -23,6 +23,7 @@ from uiprotect.data.types import (
     AlarmHubCoverStatus,
     AlarmHubInputStatus,
     AlarmHubInputType,
+    DeviceState,
     OnOffState,
 )
 
@@ -96,6 +97,11 @@ def output_is_on(output: AlarmHubOutput) -> bool:
 def output_name(output: AlarmHubOutput, output_id: int) -> str:
     """Return the output's configured name, falling back to ``Output <output_id>``."""
     return output.name or f"Output {output_id}"
+
+
+def hub_is_connected(hub: LinkStation) -> bool:
+    """True when the hub's connection state is CONNECTED."""
+    return hub.state == DeviceState.CONNECTED
 
 
 def armed_is_on(armed: OnOffState | None) -> bool:

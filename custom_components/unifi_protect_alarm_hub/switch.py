@@ -64,9 +64,13 @@ class OutputSwitch(AlarmHubBaseEntity, SwitchEntity):
         }
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self.hub.trigger_output(self._output_id, enable=True)
+        if (hub := self.hub) is None:
+            return
+        await hub.trigger_output(self._output_id, enable=True)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.hub.trigger_output(self._output_id, enable=False)
+        if (hub := self.hub) is None:
+            return
+        await hub.trigger_output(self._output_id, enable=False)
         await self.coordinator.async_request_refresh()

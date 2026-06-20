@@ -144,7 +144,7 @@ class ConnectivityBinarySensor(AlarmHubBaseEntity, BinarySensorEntity):
     @property
     def is_on(self) -> bool | None:
         hub = self.hub
-        return hub.state.value.upper() == "CONNECTED" if hub else None
+        return logic.hub_is_connected(hub) if hub else None
 
 
 class BatteryConnectionBinarySensor(AlarmHubBaseEntity, BinarySensorEntity):

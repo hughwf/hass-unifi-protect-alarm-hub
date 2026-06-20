@@ -126,6 +126,22 @@ def test_battery_connected_is_on():
     assert logic.battery_connected_is_on(None) is False
 
 
+def test_hub_is_connected():
+    assert logic.hub_is_connected(_hub()) is True
+    raw_disc = {
+        "id": "ah2",
+        "modelKey": "linkstation",
+        "state": "DISCONNECTED",
+        "name": "Hub",
+        "mac": "AABBCCDDEE00",
+        "isAlarmHub": True,
+        "ledSettings": {"isEnabled": True},
+        "alarmHub": {},
+    }
+    disc = LinkStation.from_unifi_dict(**raw_disc)
+    assert logic.hub_is_connected(disc) is False
+
+
 def test_snapshot_extracts_only_alarm_hubs():
     # a fake bootstrap exposing .alarm_hubs
     class FakeBootstrap:
