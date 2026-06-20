@@ -9,8 +9,14 @@ layer wraps them.
 
 from __future__ import annotations
 
-from uiprotect.data.public_devices import AlarmHubInput, AlarmHubOutput
-from uiprotect.data.types import AlarmHubInputStatus, AlarmHubInputType, OnOffState
+from uiprotect.data.public_devices import AlarmHubInput, AlarmHubOutput, LinkStation
+from uiprotect.data.types import (
+    AlarmHubConnectionState,
+    AlarmHubCoverStatus,
+    AlarmHubInputStatus,
+    AlarmHubInputType,
+    OnOffState,
+)
 
 ZONE_FAULT_STATUSES = {
     AlarmHubInputStatus.FAULT,
@@ -65,3 +71,30 @@ def zone_fault_unique_id(mac: str, zone_id: int) -> str:
 
 def output_unique_id(mac: str, output_id: int) -> str:
     return f"{mac}_output_{output_id}"
+
+
+def output_is_on(output: AlarmHubOutput) -> bool:
+    return output.active == OnOffState.ON
+
+
+def output_name(output: AlarmHubOutput, output_id: int) -> str:
+    return output.name or f"Output {output_id}"
+
+
+def armed_is_on(armed: OnOffState | None) -> bool:
+    return armed == OnOffState.ON
+
+
+def cover_is_on(cover) -> bool:
+    """True when the tamper cover is open."""
+    return cover is not None and cover.status == AlarmHubCoverStatus.OPEN
+
+
+def battery_connected_is_on(battery) -> bool:
+    """True when the backup battery is connected."""
+    return battery is not None and battery.connection == AlarmHubConnectionState.CONNECTED
+
+
+def snapshot(public_bootstrap) -> dict:
+    """Return a plain ``{hub_id: LinkStation}`` dict of alarm hubs only."""
+    return dict(public_bootstrap.alarm_hubs)

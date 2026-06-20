@@ -55,3 +55,59 @@ def test_unique_ids():
     assert logic.zone_unique_id("AABBCC", 2) == "AABBCC_zone_2"
     assert logic.zone_fault_unique_id("AABBCC", 2) == "AABBCC_zone_2_fault"
     assert logic.output_unique_id("AABBCC", 5) == "AABBCC_output_5"
+
+
+def _output(**kw) -> AlarmHubOutput:
+    base = {"active": "off", "enable": "on", "status": "dry"}
+    base.update(kw)
+    return AlarmHubOutput(**base)
+
+
+def test_output_is_on_from_active():
+    assert logic.output_is_on(_output(active="on")) is True
+    assert logic.output_is_on(_output(active="off")) is False
+
+
+def test_output_name_fallback():
+    assert logic.output_name(_output(name="Siren"), 1) == "Siren"
+    assert logic.output_name(_output(name=None), 1) == "Output 1"
+
+
+def _hub() -> LinkStation:
+    raw = {
+        "id": "ah1", "modelKey": "linkstation", "state": "CONNECTED",
+        "name": "Alarm Hub", "mac": "AABBCCDDEEFF", "isAlarmHub": True,
+        "ledSettings": {"isEnabled": True},
+        "alarmHub": {
+            "armed": "on",
+            "battery": {"connection": "connected", "charging": "on",
+                        "voltage": 13.2, "batteryStatus": "ok"},
+            "cover": {"status": "open", "distance": 5},
+            "input": {"1": {"enable": "on", "type": "nc", "status": "normal",
+                            "inputType": "ENTRY", "name": "Front Door"}},
+            "output": {"1": {"active": "off", "enable": "on", "status": "dry",
+                             "name": "Siren"}},
+        },
+    }
+    return LinkStation.from_unifi_dict(**raw)
+
+
+def test_armed_is_on():
+    assert logic.armed_is_on(_hub().alarm_hub_armed) is True
+
+
+def test_cover_is_on_when_open():
+    assert logic.cover_is_on(_hub().alarm_hub_cover) is True
+
+
+def test_battery_connected_is_on():
+    assert logic.battery_connected_is_on(_hub().alarm_hub_battery) is True
+
+
+def test_snapshot_extracts_only_alarm_hubs():
+    # a fake bootstrap exposing .alarm_hubs
+    class FakeBootstrap:
+        alarm_hubs = {"ah1": _hub()}
+    snap = logic.snapshot(FakeBootstrap())
+    assert set(snap) == {"ah1"}
+    assert snap["ah1"].is_alarm_hub is True
