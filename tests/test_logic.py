@@ -75,18 +75,34 @@ def test_output_name_fallback():
 
 def _hub() -> LinkStation:
     raw = {
-        "id": "ah1", "modelKey": "linkstation", "state": "CONNECTED",
-        "name": "Alarm Hub", "mac": "AABBCCDDEEFF", "isAlarmHub": True,
+        "id": "ah1",
+        "modelKey": "linkstation",
+        "state": "CONNECTED",
+        "name": "Alarm Hub",
+        "mac": "AABBCCDDEEFF",
+        "isAlarmHub": True,
         "ledSettings": {"isEnabled": True},
         "alarmHub": {
             "armed": "on",
-            "battery": {"connection": "connected", "charging": "on",
-                        "voltage": 13.2, "batteryStatus": "ok"},
+            "battery": {
+                "connection": "connected",
+                "charging": "on",
+                "voltage": 13.2,
+                "batteryStatus": "ok",
+            },
             "cover": {"status": "open", "distance": 5},
-            "input": {"1": {"enable": "on", "type": "nc", "status": "normal",
-                            "inputType": "ENTRY", "name": "Front Door"}},
-            "output": {"1": {"active": "off", "enable": "on", "status": "dry",
-                             "name": "Siren"}},
+            "input": {
+                "1": {
+                    "enable": "on",
+                    "type": "nc",
+                    "status": "normal",
+                    "inputType": "ENTRY",
+                    "name": "Front Door",
+                }
+            },
+            "output": {
+                "1": {"active": "off", "enable": "on", "status": "dry", "name": "Siren"}
+            },
         },
     }
     return LinkStation.from_unifi_dict(**raw)
@@ -108,6 +124,7 @@ def test_snapshot_extracts_only_alarm_hubs():
     # a fake bootstrap exposing .alarm_hubs
     class FakeBootstrap:
         alarm_hubs = {"ah1": _hub()}
+
     snap = logic.snapshot(FakeBootstrap())
     assert set(snap) == {"ah1"}
     assert snap["ah1"].is_alarm_hub is True

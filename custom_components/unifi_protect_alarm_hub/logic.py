@@ -9,7 +9,7 @@ layer wraps them.
 
 from __future__ import annotations
 
-from uiprotect.data.public_devices import AlarmHubInput, AlarmHubOutput, LinkStation
+from uiprotect.data.public_devices import AlarmHubInput, AlarmHubOutput
 from uiprotect.data.types import (
     AlarmHubConnectionState,
     AlarmHubCoverStatus,
@@ -92,7 +92,9 @@ def cover_is_on(cover) -> bool:
 
 def battery_connected_is_on(battery) -> bool:
     """True when the backup battery is connected."""
-    return battery is not None and battery.connection == AlarmHubConnectionState.CONNECTED
+    return (
+        battery is not None and battery.connection == AlarmHubConnectionState.CONNECTED
+    )
 
 
 def snapshot(public_bootstrap) -> dict:
