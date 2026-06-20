@@ -148,7 +148,7 @@ class ConnectivityBinarySensor(AlarmHubBaseEntity, BinarySensorEntity):
 
 
 class BatteryConnectionBinarySensor(AlarmHubBaseEntity, BinarySensorEntity):
-    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_device_class = BinarySensorDeviceClass.PLUG
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Backup battery connection"
 

@@ -1,9 +1,4 @@
-"""Tier-1 tests for the API client using a fake aiohttp session.
-
-NOTE: these are ``async def`` and require ``asyncio_mode = "auto"`` (set in the
-repo-root ``pyproject.toml`` in Task F). Until then they are not runnable;
-run ``tests/test_models.py`` and ``tests/test_logic.py`` instead.
-"""
+"""Tier-1 tests for the API client using a fake aiohttp session."""
 
 from __future__ import annotations
 
@@ -71,10 +66,21 @@ async def test_401_raises_auth_error():
         await client.async_get_alarm_hubs()
 
 
+async def test_403_raises_auth_error():
+    client = _client(_FakeSession(_FakeResp(403)))
+    with pytest.raises(AlarmHubAuthError):
+        await client.async_get_alarm_hubs()
+
+
 async def test_500_raises_connection_error():
     client = _client(_FakeSession(_FakeResp(500)))
     with pytest.raises(AlarmHubConnectionError):
         await client.async_get_alarm_hubs()
+
+
+async def test_non_list_response_returns_empty():
+    client = _client(_FakeSession(_FakeResp(200, {"unexpected": "object"})))
+    assert await client.async_get_alarm_hubs() == []
 
 
 async def test_client_error_raises_connection_error():
