@@ -1,4 +1,9 @@
-"""Tier-1 tests for the API client using a fake aiohttp session."""
+"""Tier-1 tests for the API client using a fake aiohttp session.
+
+NOTE: these are ``async def`` and require ``asyncio_mode = "auto"`` (set in the
+repo-root ``pyproject.toml`` in Task F). Until then they are not runnable;
+run ``tests/test_models.py`` and ``tests/test_logic.py`` instead.
+"""
 
 from __future__ import annotations
 

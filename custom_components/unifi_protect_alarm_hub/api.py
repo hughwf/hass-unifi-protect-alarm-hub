@@ -60,6 +60,9 @@ class AlarmHubApiClient:
         """Return all adopted alarm hubs with full current state."""
         data = await self._request("GET", "/v1/alarm-hubs")
         if not isinstance(data, list):
+            _LOGGER.warning(
+                "Unexpected response from /v1/alarm-hubs: %s", type(data).__name__
+            )
             return []
         return [AlarmHub.from_json(item) for item in data if isinstance(item, dict)]
 
