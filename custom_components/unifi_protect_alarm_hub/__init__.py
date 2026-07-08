@@ -28,9 +28,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: AlarmHubConfigEntry) -> 
 
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Start real-time WebSocket push (best-effort; REST polling is the fallback).
+    coordinator.start_ws()
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: AlarmHubConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        await entry.runtime_data.async_shutdown()
+    return unloaded

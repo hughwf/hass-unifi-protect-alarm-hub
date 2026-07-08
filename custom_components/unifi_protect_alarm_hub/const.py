@@ -17,8 +17,9 @@ PLATFORMS: list[Platform] = [
 DEFAULT_PORT = 443
 DEFAULT_VERIFY_SSL = False
 
-# REST polling is the primary update mechanism for v0.1.
-SCAN_INTERVAL = timedelta(seconds=15)
+# WebSocket push is the primary update path (v0.2); REST polling is a fallback
+# safety net and the initial load, so it can be infrequent.
+SCAN_INTERVAL = timedelta(minutes=5)
 
 MANUFACTURER = "Ubiquiti"
 MODEL = "Alarm Hub"
