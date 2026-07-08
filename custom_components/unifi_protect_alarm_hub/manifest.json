@@ -6,8 +6,8 @@
   "dependencies": [],
   "documentation": "https://github.com/hughwf/hass-unifi-protect-alarm-hub",
   "integration_type": "hub",
-  "iot_class": "local_polling",
+  "iot_class": "local_push",
   "issue_tracker": "https://github.com/hughwf/hass-unifi-protect-alarm-hub/issues",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

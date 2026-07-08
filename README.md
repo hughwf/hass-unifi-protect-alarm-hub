@@ -43,9 +43,16 @@ Zones reported as disabled by the hub are created **disabled by default** —
 enable them in the entity settings if wired.
 
 ## How updates work
-v0.1 **polls** the Protect public API every 15 seconds (each poll returns full
-hub state). Real-time WebSocket push (`/subscribe/devices`) is a planned
-enhancement.
+Updates are **real-time**. The integration subscribes to the Protect devices
+WebSocket (`/subscribe/devices`); when the alarm hub reports a change (zone
+opened, output triggered, tamper, armed state, etc.) it triggers an immediate
+refresh of full hub state, so entities update within about a second.
+
+REST polling still runs every **5 minutes** as a fallback safety net (and for
+the initial load), so state stays correct even if the WebSocket drops. The
+WebSocket reconnects automatically with exponential backoff, and a connection
+failure never blocks setup — the integration loads on the first REST refresh and
+adds the WebSocket on top.
 
 ## Troubleshooting
 Enable debug logging:
