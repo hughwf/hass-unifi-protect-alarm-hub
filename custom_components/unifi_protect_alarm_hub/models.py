@@ -161,6 +161,52 @@ def _int_keyed(raw: Any, parse: Callable[[int, dict[str, Any]], Any]) -> dict[in
     return out
 
 
+def describe_hub_payload(data: Any) -> str:
+    """One short line describing a hub payload's shape, for debug logs.
+
+    The payload runs to tens of kilobytes on a real console -- most of it power
+    metering and per-terminal electrical state this integration does not read --
+    and log exporters truncate a line that long. So the fields a schema question
+    actually turns on can be missing from a log captured to answer one. This
+    keeps what a reader needs: which keys arrived, which zones exist, and what
+    they report. Never raises: a payload too odd to describe is exactly when a
+    reader needs the line most.
+    """
+    if not isinstance(data, dict):
+        return f"<{type(data).__name__}>"
+    hub = data.get("alarmHub")
+    parts = [
+        f"id={data.get('id')!r}",
+        f"modelKey={data.get('modelKey')!r}",
+        f"state={data.get('state')!r}",
+        f"isAlarmHub={data.get('isAlarmHub')!r}",
+        f"mac={'set' if data.get('mac') else 'missing'}",
+    ]
+    if not isinstance(hub, dict):
+        parts.append(f"alarmHub=<{type(hub).__name__}>")
+        return " ".join(parts)
+    parts.append(f"alarmHub keys={sorted(hub)}")
+    for section in ("input", "output"):
+        entries = hub.get(section)
+        if not isinstance(entries, dict):
+            parts.append(f"{section}=<{type(entries).__name__}>")
+            continue
+        described = []
+        for key in sorted(entries, key=lambda k: (len(k), k)):
+            value = entries[key]
+            if not isinstance(value, dict):
+                described.append(f"{key}:<{type(value).__name__}>")
+                continue
+            fields = [
+                f for f in ("status", "active", "inputType", "type") if f in value
+            ]
+            described.append(
+                f"{key}:{{" + ",".join(f"{f}={value[f]!r}" for f in fields) + "}"
+            )
+        parts.append(f"{section}({len(entries)})=" + " ".join(described))
+    return " ".join(parts)
+
+
 @dataclass(frozen=True)
 class InputZone:
     zone_id: int

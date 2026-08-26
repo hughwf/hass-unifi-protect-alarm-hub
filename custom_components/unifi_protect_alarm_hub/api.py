@@ -23,7 +23,7 @@ from typing import Any
 
 import aiohttp
 
-from .models import AlarmHub
+from .models import AlarmHub, describe_hub_payload
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -189,7 +189,12 @@ class AlarmHubApiClient:
         """
         data = await self._request("GET", "/v1/alarm-hubs")
         # The other half of the shape question: what a delta is merged *into*.
+        # Two lines, because the full payload is routinely truncated by log
+        # exporters and the summary is what survives.
         _LOGGER.debug("Alarm-hub snapshot: %s", data)
+        if _LOGGER.isEnabledFor(logging.DEBUG) and isinstance(data, list):
+            for item in data:
+                _LOGGER.debug("Alarm-hub shape: %s", describe_hub_payload(item))
         if not isinstance(data, list):
             raise AlarmHubConnectionError(
                 f"Expected a list from /v1/alarm-hubs, got {type(data).__name__}"

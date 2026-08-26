@@ -306,6 +306,11 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
     def _on_ws_connected(self) -> None:
         """The devices WebSocket is up: start the uptime clock, and resync."""
         self._ws_connected_at = self.hass.loop.time()
+        # Logged on every connect, not just a recovery: a healthy socket on a
+        # quiet hub says nothing at all, so without this there is no way to tell
+        # it apart from one that never opened -- which is the first thing to
+        # establish when a frame someone expected did not arrive.
+        _LOGGER.debug("UniFi Protect WebSocket connected")
         if not self._ws_down:
             # First connect of the session, moments after setup took its own
             # snapshot: nothing has been missed, so skip the duplicate request.

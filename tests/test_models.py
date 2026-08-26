@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
+
 from custom_components.unifi_protect_alarm_hub.models import (
     AlarmHub,
     deep_merge,
+    describe_hub_payload,
     keeps_hub_shape,
 )
 
@@ -497,3 +500,41 @@ def test_a_junk_zone_entry_is_skipped_rather_than_parsed():
 
     assert set(hub.alarm_hub_inputs) == {2}
     assert hub.alarm_hub_inputs[2].status == "alarm"
+
+
+# --- describe_hub_payload() ---
+
+
+def test_the_shape_summary_keeps_what_a_schema_question_turns_on():
+    """Short enough to survive truncation, specific enough to answer with."""
+    described = describe_hub_payload(RAW)
+
+    assert "modelKey='linkstation'" in described
+    assert "state='CONNECTED'" in described
+    assert "mac=set" in described
+    assert "input(2)=" in described
+    assert "status='normal'" in described and "inputType='ENTRY'" in described
+    assert "output(1)=" in described and "active='off'" in described
+    # The point of the line is that a log exporter does not cut it in half.
+    assert len(described) < 1000
+
+
+def test_the_shape_summary_says_when_a_field_is_missing_rather_than_lying():
+    described = describe_hub_payload({"id": "ah1", "alarmHub": {"input": {}}})
+
+    assert "mac=missing" in described
+    assert "input(0)=" in described
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param("not a dict", id="not-a-mapping"),
+        pytest.param({"alarmHub": "unavailable"}, id="alarmHub-not-a-mapping"),
+        pytest.param({"alarmHub": {"input": []}}, id="input-not-a-mapping"),
+        pytest.param({"alarmHub": {"input": {"6": "junk"}}}, id="zone-not-a-mapping"),
+    ],
+)
+def test_the_shape_summary_survives_the_payloads_worth_describing(payload):
+    """A payload odd enough to break the parser is when the line matters most."""
+    assert describe_hub_payload(payload)
