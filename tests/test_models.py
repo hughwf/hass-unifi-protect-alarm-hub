@@ -511,7 +511,8 @@ def test_the_shape_summary_keeps_what_a_schema_question_turns_on():
 
     assert "modelKey='linkstation'" in described
     assert "state='CONNECTED'" in described
-    assert "mac=set" in described
+    assert "mac='AABBCCDDEEFF'" in described
+    assert "name='Alarm Hub'" in described
     assert "input(2)=" in described
     assert "status='normal'" in described and "inputType='ENTRY'" in described
     assert "output(1)=" in described and "active='off'" in described
@@ -522,7 +523,7 @@ def test_the_shape_summary_keeps_what_a_schema_question_turns_on():
 def test_the_shape_summary_says_when_a_field_is_missing_rather_than_lying():
     described = describe_hub_payload({"id": "ah1", "alarmHub": {"input": {}}})
 
-    assert "mac=missing" in described
+    assert "mac=None" in described
     assert "input(0)=" in described
 
 
@@ -538,3 +539,12 @@ def test_the_shape_summary_says_when_a_field_is_missing_rather_than_lying():
 def test_the_shape_summary_survives_the_payloads_worth_describing(payload):
     """A payload odd enough to break the parser is when the line matters most."""
     assert describe_hub_payload(payload)
+
+
+def test_the_shape_summary_distinguishes_two_hubs_on_one_console():
+    """The two-hub question is whether these rows name the same hardware."""
+    one = describe_hub_payload({**RAW, "id": "ah1", "mac": "AABBCCDDEEFF"})
+    two = describe_hub_payload({**RAW, "id": "ah2", "mac": "9041B2E6E2CB"})
+
+    assert "mac='AABBCCDDEEFF'" in one
+    assert "mac='9041B2E6E2CB'" in two

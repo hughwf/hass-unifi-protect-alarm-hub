@@ -180,7 +180,12 @@ def describe_hub_payload(data: Any) -> str:
         f"modelKey={data.get('modelKey')!r}",
         f"state={data.get('state')!r}",
         f"isAlarmHub={data.get('isAlarmHub')!r}",
-        f"mac={'set' if data.get('mac') else 'missing'}",
+        # The mac verbatim, not a "set"/"missing" flag. Identity turns on it, so
+        # the question a reader brings to a two-hub console -- do these two rows
+        # name the same hardware? -- is unanswerable without the value. It is in
+        # the full payload anyway; this is the copy that survives truncation.
+        f"mac={data.get('mac')!r}",
+        f"name={data.get('name')!r}",
     ]
     if not isinstance(hub, dict):
         parts.append(f"alarmHub=<{type(hub).__name__}>")
