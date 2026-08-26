@@ -184,10 +184,14 @@ class FakeConsole:
         self._on_frame(frame)
 
 
-async def setup_integration(
-    hass: HomeAssistant, console: FakeConsole
-) -> MockConfigEntry:
-    """Set the integration up against ``console`` and wait for its entities."""
+def add_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """The config entry this integration's tests use, added but not set up.
+
+    Split out so a test can put registry rows on it *before* the first setup
+    reads them -- which is what an upgrade is: the entry and its devices and
+    entities are already on disk, written by a release whose identity rule was
+    not this one, and setup has to recognise them.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -198,8 +202,88 @@ async def setup_integration(
         },
     )
     entry.add_to_hass(hass)
+    return entry
+
+
+async def start(
+    hass: HomeAssistant, entry: MockConfigEntry, console: FakeConsole
+) -> None:
+    """Set ``entry`` up against ``console`` and wait for its entities."""
+    await _async_setup(hass, entry, console)
+
+
+async def setup_integration(
+    hass: HomeAssistant, console: FakeConsole
+) -> MockConfigEntry:
+    """Set the integration up against ``console`` and wait for its entities."""
+    entry = add_entry(hass)
     await _async_setup(hass, entry, console)
     return entry
+
+
+# What a release registered for the standard ``hub_json`` hub: eleven entities,
+# each ``f"{identity}_{suffix}"``, on one device row filed under that identity.
+# The released 0.2 built both from ``hub.mac`` verbatim -- the raw string out of
+# console JSON, placeholder or empty included -- which is why an upgrade has to
+# recognise strings this integration would never choose today.
+RELEASED_ENTITIES = (
+    ("binary_sensor", "zone_4"),
+    ("binary_sensor", "zone_4_fault"),
+    ("binary_sensor", "zone_6"),
+    ("binary_sensor", "zone_6_fault"),
+    ("binary_sensor", "tamper"),
+    ("binary_sensor", "armed"),
+    ("binary_sensor", "connectivity"),
+    ("binary_sensor", "battery_connection"),
+    ("sensor", "battery_status"),
+    ("sensor", "battery_voltage"),
+    ("switch", "output_1"),
+)
+
+
+def as_an_earlier_release_left_it(
+    hass: HomeAssistant,
+    entry: MockConfigEntry,
+    identity: str,
+    *,
+    name: str = "Alarm Hub Kit",
+) -> dr.DeviceEntry:
+    """Fill both registries the way a release with a different identity rule did.
+
+    An upgrade never starts from an empty registry, and every failure this
+    guards is invisible from one: the ids are already on disk, the device row is
+    already there, and what setup must not do is decide the hub is called
+    something else. Written here rather than by running the old code so the
+    strings are visible in the test -- the scratch upgrade matrix checks them
+    against what 0.2 and the two staged commits actually produce.
+    """
+    # The entry itself is part of what the earlier release left: its config flow
+    # always wrote f"{host}:{port}". Leaving unique_id None made every upgrade
+    # test run against a shape no released install has -- async_migrate_unique_id
+    # returned immediately, so the re-key and the device re-file were never
+    # exercised together, and a guard that read that id as a mac went unnoticed
+    # for four rounds.
+    hass.config_entries.async_update_entry(
+        entry, unique_id=f"{entry.data[CONF_HOST]}:{entry.data[CONF_PORT]}"
+    )
+    device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id, identifiers={(DOMAIN, identity)}, name=name
+    )
+    registry = er.async_get(hass)
+    for domain, suffix in RELEASED_ENTITIES:
+        registry.async_get_or_create(
+            domain,
+            DOMAIN,
+            f"{identity}_{suffix}",
+            config_entry=entry,
+            device_id=device.id,
+            # One disabled row, because a disabled entity is still the user's:
+            # leaving its unique_id behind strands it the moment they enable it.
+            disabled_by=(
+                er.RegistryEntryDisabler.INTEGRATION if suffix == "zone_4" else None
+            ),
+        )
+    return device
 
 
 async def restart(

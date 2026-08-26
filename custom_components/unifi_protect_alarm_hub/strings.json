@@ -10,15 +10,38 @@
           "api_key": "API Key",
           "verify_ssl": "Verify SSL certificate"
         }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate UniFi Protect Alarm Hub",
+        "description": "The API key for your UniFi Protect console was rejected. Create a new key (UniFi OS → Settings → Control Plane → Integrations) and enter it below.",
+        "data": {
+          "api_key": "API Key"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure UniFi Protect Alarm Hub",
+        "description": "Update the address, port or API key of your UniFi Protect console. The new settings are checked before they are saved.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "api_key": "API Key",
+          "verify_ssl": "Verify SSL certificate"
+        }
       }
     },
     "error": {
       "cannot_connect": "Failed to connect",
       "invalid_auth": "Invalid authentication",
+      "invalid_host": "That address cannot be used. Enter the console's host name or IP address, for example 192.168.1.1.",
+      "no_alarm_hub": "Connected to the console, but it has no adopted Alarm Hub, so there would be nothing to control. Adopt the hub in UniFi Protect and submit again.",
       "unknown": "Unexpected error"
     },
     "abort": {
-      "already_configured": "Device is already configured"
+      "already_configured": "This UniFi Protect console is already configured",
+      "different_console": "That address is a different UniFi Protect console: none of the Alarm Hubs this entry already has devices for are on it. Moving the entry there would leave every entity it owns unavailable, and every automation using them would stop running. Add the other console as a new entry instead.",
+      "reauth_successful": "The new API key was accepted",
+      "reconfigure_successful": "The new settings were accepted",
+      "unique_id_mismatch": "That key reached a different UniFi Protect console: none of the Alarm Hubs this entry owns are on it. Enter a key for the console this entry was set up with, or add the other console as a new entry."
     }
   }
 }

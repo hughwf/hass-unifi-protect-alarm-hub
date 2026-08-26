@@ -164,7 +164,19 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
         entry: ConfigEntry,
         client: AlarmHubApiClient,
     ) -> None:
-        super().__init__(hass, _LOGGER, name=DOMAIN, update_interval=SCAN_INTERVAL)
+        # ``config_entry`` explicitly, not by way of the ``current_entry``
+        # ContextVar the base class falls back to. That ContextVar is set only
+        # while HA is running setup, and ``_async_refresh`` escalates an auth
+        # failure with ``if self.config_entry: async_start_reauth(...)`` -- so a
+        # coordinator built outside that window silently loses the escalation,
+        # and every test that built one proved nothing about it.
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=DOMAIN,
+            update_interval=SCAN_INTERVAL,
+        )
         self.entry = entry
         self.client = client
         self._ws_task: asyncio.Task[None] | None = None
@@ -259,11 +271,14 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
             except asyncio.CancelledError:
                 raise
             except AlarmHubAuthError as err:
-                # The key was revoked or rotated, so retrying cannot fix it; the
-                # REST poll hits the same 401 and raises ConfigEntryAuthFailed,
-                # which is what surfaces it to the user for now.
-                # TODO: escalate straight to a reauth flow from here, once the
-                # config flow has a reauth step to escalate to.
+                # The key was revoked or rotated, so reconnecting cannot fix it:
+                # ask the user for a new one instead of waiting up to five
+                # minutes for the REST poll to reach the same conclusion. HA
+                # drops the request if a reauth or reconfigure flow for this
+                # entry is already open, so the retry loop cannot stack them up,
+                # and the loop keeps running -- a key repaired by that flow
+                # reloads the entry from under it.
+                self.entry.async_start_reauth(self.hass)
                 reason = f"rejected the API key ({err})"
             except Exception as err:
                 reason = f"dropped ({err})"

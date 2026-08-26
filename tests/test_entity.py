@@ -22,9 +22,12 @@ from custom_components.unifi_protect_alarm_hub.api import AlarmHubConnectionErro
 from custom_components.unifi_protect_alarm_hub.const import DOMAIN, SCAN_INTERVAL
 from platform_common import (  # noqa: F401  (unload_entries is an autouse fixture)
     MAC,
+    RELEASED_ENTITIES,
     FakeConsole,
+    add_entry,
     advance,
     armed_call_later_handles,
+    as_an_earlier_release_left_it,
     failed_poll,
     hub_devices,
     hub_frame,
@@ -34,6 +37,7 @@ from platform_common import (  # noqa: F401  (unload_entries is an autouse fixtu
     published_states,
     restart,
     setup_integration,
+    start,
     unique_ids,
     unload_entries,
     zone_frame,
@@ -462,6 +466,299 @@ async def test_a_mac_that_appears_while_the_integration_was_down_keeps_the_devic
     assert unique_ids(hass) == before
     assert len(hub_devices(hass, entry)) == 1
     assert hass.states.get(GARAGE).state == STATE_OFF
+
+
+async def test_a_placeholder_mac_never_becomes_an_identity_to_lose(hass):
+    """B2 end to end: adopt mid-adoption, let the mac land, restart.
+
+    The placeholder looks like a mac and is not one -- it is what the console
+    reports for a hub whose own it has not read. Taken as the identity, it was
+    recorded in the device registry and then abandoned by the hub the moment the
+    real mac appeared: the restart after that seeded ``{'000000000000'}``,
+    recognised nothing, and minted a second device. The eleven entities every
+    automation names were left on the first with nothing updating them, eleven
+    more appeared with ``_2`` entity ids, and the live half was the half nobody
+    had written an automation against.
+    """
+    console = FakeConsole(hub_json(mac=PLACEHOLDER_MAC))
+    entry = await setup_integration(hass, console)
+    before = unique_ids(hass)
+    assert len(before) == 11
+    assert [device.identifiers for device in hub_devices(hass, entry)] == [
+        {(DOMAIN, "ah1")}
+    ]
+
+    console.payloads[0]["mac"] = MAC
+    await poll(hass, entry)
+    await restart(hass, entry, console)
+
+    assert unique_ids(hass) == before
+    assert len(hub_devices(hass, entry)) == 1
+    assert hass.states.get(GARAGE).state == STATE_OFF
+
+
+@pytest.mark.parametrize(
+    ("filed_as", "reports"),
+    [
+        pytest.param("aabbcc", "aabbcc", id="a hub filed under a mac that is not one"),
+        pytest.param(MAC, MAC, id="an ordinary hub"),
+        pytest.param(MAC, "aa:bb:cc:dd:ee:ff", id="the same, spelled the other way"),
+        pytest.param("aa:bb:cc:dd:ee:ff", MAC, id="and back again"),
+    ],
+)
+async def test_an_upgrade_keeps_every_id_an_earlier_release_wrote(
+    hass, filed_as, reports
+):
+    """The whole upgrade contract, from the registry an install already has.
+
+    Released 0.2 filed a hub under ``hub.mac`` verbatim and built all eleven
+    unique_ids from the same string, so the strings on disk include ones nothing
+    would choose today. A rule that only recognises identities it would mint
+    itself reads every one of those installs as a hub it has never seen -- a
+    second device row, eleven new entities, the originals orphaned at
+    ``unavailable`` for good, and the live ones taking ``_2`` entity ids that no
+    automation names.
+
+    So what is on disk wins, whatever it looks like, and it wins over an
+    identity the console's *current* payload would otherwise justify.
+
+    The two strings that name no hardware -- the empty string and the
+    placeholder -- are the exception, and are not merely kept but re-filed once:
+    see ``test_a_row_naming_no_hardware_is_re_filed_under_one_that_does``.
+    ``aabbcc`` is not one of them. It is a mac nobody can use as an identity
+    *across consoles*, but it is a string this console alone reports, so the row
+    stays exactly where it is.
+    """
+    entry = add_entry(hass)
+    device = as_an_earlier_release_left_it(hass, entry, filed_as)
+    before = unique_ids(hass)
+    entity_ids_before = {
+        entry.unique_id: entry.entity_id
+        for entry in er.async_entries_for_device(er.async_get(hass), device.id)
+    }
+
+    await start(hass, entry, FakeConsole(hub_json(mac=reports)))
+
+    assert unique_ids(hass) == before
+    assert [row.identifiers for row in hub_devices(hass, entry)] == [
+        {(DOMAIN, filed_as)}
+    ]
+    assert {
+        entry.unique_id: entry.entity_id
+        for entry in er.async_entries_for_device(er.async_get(hass), device.id)
+    } == entity_ids_before
+    # ...and they are live, not merely still on disk.
+    assert hass.states.get(entity_ids_before[f"{filed_as}_zone_6"]).state == STATE_OFF
+
+
+@pytest.mark.parametrize(
+    ("filed_as", "reports", "becomes"),
+    [
+        pytest.param("", "", "ah1", id="no mac at all, and still none"),
+        pytest.param(PLACEHOLDER_MAC, PLACEHOLDER_MAC, "ah1", id="still mid-adoption"),
+        pytest.param("", MAC, MAC, id="a mac-less hub whose mac has since arrived"),
+        pytest.param(PLACEHOLDER_MAC, MAC, MAC, id="and one adopted mid-adoption"),
+    ],
+)
+async def test_a_row_naming_no_hardware_is_re_filed_under_one_that_does(
+    hass, filed_as, reports, becomes
+):
+    """The released mid-adoption install, migrated instead of abandoned.
+
+    A device row records the identity and nothing else, so a hub is recognised
+    by a string it still reports -- and the empty string and the placeholder are
+    strings a console stops reporting the moment it reads the hub's real mac.
+    Left alone, such a row is a time bomb with the fuse lit by the console:
+    whichever restart follows the mac landing matches nothing, mints a second
+    device, and leaves eleven entities with no state object while eleven more
+    take ``_2`` entity ids that no automation names. Both halves of that are
+    covered here -- the mac has not arrived yet in the first two cases and had
+    already arrived in the last two, and neither ends in a second device.
+
+    So the row is re-filed, once, under the identity a fresh install would mint
+    for that hub today, and the eleven unique_ids built from the old string move
+    with it. What a user can see does not move at all: same device row, same
+    entity ids, same states, same customisations.
+
+    The guess it makes is one row, one hub. That is not much of a guess -- the
+    string on the row never named hardware, so there was never a second
+    candidate -- and it is the same inference the registry seed already makes
+    every process start, taken once and written down instead of re-taken on
+    every restart. Where there is more than one of either, it refuses: see
+    ``test_a_row_naming_no_hardware_is_left_alone_when_anything_is_ambiguous``.
+    """
+    entry = add_entry(hass)
+    device = as_an_earlier_release_left_it(hass, entry, filed_as)
+    registry = er.async_get(hass)
+    before = {
+        item.unique_id: item.entity_id
+        for item in er.async_entries_for_device(
+            registry, device.id, include_disabled_entities=True
+        )
+    }
+    assert len(before) == len(RELEASED_ENTITIES)
+
+    await start(hass, entry, FakeConsole(hub_json(mac=reports)))
+
+    moved = {
+        item.unique_id: item.entity_id
+        for item in er.async_entries_for_device(
+            registry, device.id, include_disabled_entities=True
+        )
+    }
+    assert set(moved) == {f"{becomes}_{suffix}" for _, suffix in RELEASED_ENTITIES}
+    assert unique_ids(hass) == set(moved)
+    # The same eleven registry rows, on the same device row, under new keys --
+    # which is the whole point: unique_id is the registry's plumbing and
+    # entity_id is what every automation in the house is written against.
+    assert sorted(moved.values()) == sorted(before.values())
+    assert [row.identifiers for row in hub_devices(hass, entry)] == [
+        {(DOMAIN, becomes)}
+    ]
+    assert hass.states.get(before[f"{filed_as}_zone_6"]).state == STATE_OFF
+
+    # ...and it holds through the mac landing and the restart that used to be
+    # where the second device appeared. The migration does not run twice: the
+    # identity it moved to names hardware, which is the condition it tests.
+    await restart(hass, entry, FakeConsole(hub_json(mac=MAC)))
+
+    assert unique_ids(hass) == set(moved)
+    assert [row.identifiers for row in hub_devices(hass, entry)] == [
+        {(DOMAIN, becomes)}
+    ]
+    assert hass.states.get(before[f"{filed_as}_zone_6"]).state == STATE_OFF
+
+
+@pytest.mark.parametrize(
+    "reports",
+    [
+        pytest.param(MAC, id="the hub the other row is for"),
+        pytest.param("112233445566", id="a hub neither row is for"),
+    ],
+)
+async def test_a_row_naming_no_hardware_is_left_alone_when_anything_is_ambiguous(
+    hass, reports
+):
+    """The limit that stays, pinned so it stays deliberate.
+
+    Re-filing a row that names no hardware is only safe while there is exactly
+    one row and exactly one hub, because then there is nothing to pair wrongly.
+    A second row means the install has run more than one hub, and a snapshot
+    missing one of them -- rebooting, un-adopted, mid-adoption, replaced -- would
+    offer the survivor to a row that is not its own, handing eleven entities to
+    different hardware. The second case here is that exactly: one hub, neither
+    row's, and one unmatched row naming no hardware. Pairing them is the guess
+    round 3 named and this still refuses to make; it is also the only one of the
+    two the identifier-collision check does not catch on its own.
+
+    Refusing leaves the pre-0.3 two-hub install where it was: recognised for as
+    long as the console keeps reporting the string on the row, and a new device
+    on the restart after it stops. Not a regression -- 0.2 recomputed identity
+    from the payload on every start, so it moved on that same restart -- and not
+    repeatable, because no row is created under either string any more (see
+    ``logic.device_identifier``).
+    """
+    entry = add_entry(hass)
+    as_an_earlier_release_left_it(hass, entry, "")
+    as_an_earlier_release_left_it(hass, entry, MAC, name="Shed Hub")
+
+    await start(hass, entry, FakeConsole(hub_json(mac=reports)))
+
+    assert {"_armed", f"{MAC}_armed"} <= unique_ids(hass)
+    assert {frozenset({(DOMAIN, "")}), frozenset({(DOMAIN, MAC)})} <= {
+        frozenset(row.identifiers) for row in hub_devices(hass, entry)
+    }
+
+
+async def test_a_row_naming_no_hardware_is_left_alone_beside_a_second_hub(hass):
+    """The other half of the ambiguity: one row, two hubs on the console.
+
+    Which of them the row belongs to is exactly what a row naming no hardware
+    does not say, so nothing is re-filed and the seed carries the install for as
+    long as the console keeps reporting the string it was written under.
+    """
+    entry = add_entry(hass)
+    as_an_earlier_release_left_it(hass, entry, PLACEHOLDER_MAC)
+
+    await start(
+        hass,
+        entry,
+        FakeConsole(hub_json(mac=PLACEHOLDER_MAC), hub_json("ah2", mac=MAC)),
+    )
+
+    assert f"{PLACEHOLDER_MAC}_armed" in unique_ids(hass)
+    assert {frozenset(row.identifiers) for row in hub_devices(hass, entry)} == {
+        frozenset({(DOMAIN, PLACEHOLDER_MAC)}),
+        frozenset({(DOMAIN, MAC)}),
+    }
+
+
+async def test_a_row_naming_no_hardware_is_left_alone_if_the_new_ids_are_taken(hass):
+    """All of it is planned before any of it is applied.
+
+    ``async_update_entity`` raises on a unique_id already in use, so a partial
+    plan would leave the row half-migrated -- some entities under the new
+    identity, the rest under the old, and the device row under whichever of the
+    two the last statement reached. The whole plan is built and checked before
+    a line of it is applied, so a target that is taken calls the migration off
+    rather than half-doing it: the install lands back on the pre-migration
+    behaviour, which is the second device row asserted below, and not somewhere
+    new.
+
+    One stranded id is enough to prove it, and one is what a registry in this
+    state holds: an entity from a run that already minted the second identity,
+    left behind when its device row was deleted.
+    """
+    entry = add_entry(hass)
+    device = as_an_earlier_release_left_it(hass, entry, PLACEHOLDER_MAC)
+    registry = er.async_get(hass)
+    registry.async_get_or_create(
+        "binary_sensor", DOMAIN, f"{MAC}_zone_6", config_entry=entry
+    )
+    before = {
+        item.unique_id: item.entity_id
+        for item in er.async_entries_for_device(
+            registry, device.id, include_disabled_entities=True
+        )
+    }
+
+    await start(hass, entry, FakeConsole(hub_json(mac=MAC)))
+
+    assert {
+        item.unique_id: item.entity_id
+        for item in er.async_entries_for_device(
+            registry, device.id, include_disabled_entities=True
+        )
+    } == before
+    assert {frozenset(row.identifiers) for row in hub_devices(hass, entry)} == {
+        frozenset({(DOMAIN, PLACEHOLDER_MAC)}),
+        frozenset({(DOMAIN, MAC)}),
+    }
+
+
+async def test_a_malformed_identifier_does_not_load_an_entry_with_no_entities(hass):
+    """The device registry restores identifiers with no arity checked.
+
+    ``DeviceRegistry._async_load_data`` rebuilds each one as ``tuple(iden)``
+    straight out of JSON, so a hand-edited or partially restored
+    ``core.device_registry`` can hold a one-element identifier -- and unpacking
+    it into ``domain, identifier`` raises ValueError while the seed is being
+    read. Raised there it is caught by platform setup and logged, so the entry
+    reports LOADED, publishes not one entity, and says nothing about why: the
+    worst shape a failure can take on an alarm integration, because every
+    automation just stops without anything going unavailable to test for.
+    """
+    entry = add_entry(hass)
+    device = as_an_earlier_release_left_it(hass, entry, MAC)
+    dr.async_get(hass).async_update_device(
+        device.id, new_identifiers={(DOMAIN, MAC), (DOMAIN,)}
+    )
+
+    await start(hass, entry, FakeConsole(hub_json(mac=MAC)))
+
+    assert unique_ids(hass) == {f"{MAC}_{suffix}" for _, suffix in RELEASED_ENTITIES}
+    assert hass.states.get(_zone_entity_id(hass)).state == STATE_OFF
+    assert len(hub_devices(hass, entry)) == 1
 
 
 async def test_an_unnamed_hub_does_not_take_generic_entity_ids(hass):

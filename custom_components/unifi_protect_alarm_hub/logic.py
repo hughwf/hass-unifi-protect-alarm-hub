@@ -15,7 +15,9 @@ not know, and it fails both ``state == 'on'`` and ``state == 'off'``.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
+from typing import Any
 
 from .models import AlarmHub, Battery, Cover, InputZone, OutputChannel
 
@@ -88,8 +90,8 @@ def entity_unique_id(device_id: str, suffix: str) -> str:
     """Compose one entity's permanent registry identity for a hub device.
 
     Every unique_id in the integration is built here, and always from the same
-    string ``device_identifier`` puts in the DeviceInfo, so device identity and
-    entity identity cannot drift apart. Built from the raw ``mac`` instead, they
+    string ``HubDeviceIds.resolve`` puts in the DeviceInfo, so device identity
+    and entity identity cannot drift apart. Built from the raw ``mac``, they
     did: ``mac`` is an unvalidated ``data.get("mac", "")`` from console JSON, so
     a mid-adoption snapshot that answers before it is populated -- or a delta
     that nulls it -- silently renamed every unique_id under the hub. Home
@@ -97,9 +99,11 @@ def entity_unique_id(device_id: str, suffix: str) -> str:
     the first set left pointing at the same hardware forever, and two hubs that
     both report a blank mac collide on every hub-level id instead.
 
-    ``device_identifier`` returns the raw ``mac`` verbatim whenever there is a
-    usable one, which is what makes this safe to adopt on an existing install:
-    the ids users already have are the ids this still produces.
+    What makes this safe to adopt on an existing install is not the shape of
+    the string but where it comes from: ``HubDeviceIds`` hands back the identity
+    the device registry already holds for the hub whenever it holds one, so the
+    ids users already have are the ids this still produces. Only a hub nothing
+    has been recorded for gets a freshly minted one (see ``device_identifier``).
     """
     return f"{device_id}_{suffix}"
 
@@ -204,38 +208,192 @@ def push_is_fresh(delivered_at: float, now: float, window: float) -> bool:
     return now - delivered_at < window
 
 
-def hub_keys(hub: AlarmHub | None, hub_id: str) -> tuple[str, ...]:
-    """Every string this snapshot entry can be recognised by, best first.
+# A mac written the two ways one console writes it -- ``AA:BB:CC:DD:EE:FF`` in
+# one payload and ``aabbccddeeff`` in the next -- is one piece of hardware, and
+# read as two strings it is two identities. Twelve hex digits once whatever
+# separated them is gone.
+_MAC_SEPARATORS = re.compile(r"[^0-9a-f]")
+_MAC_DIGITS = 12
 
-    ``mac`` is typed ``str`` but arrives as an unchecked ``data.get("mac", "")``
-    from console JSON, and two shapes of it do real damage. A non-string (a
-    list, say) is unhashable and raised ``TypeError`` inside
-    ``DeviceInfo(identifiers=...)``, failing platform setup outright; an empty
-    one collapses every hub onto one identity, which Home Assistant answers by
-    dropping the second hub's entities as duplicate unique ids. So only a usable
-    mac is offered, and ``hub_id`` is always offered: the coordinator has
-    already validated it as a usable string and keys the snapshot by it, so it
-    is both present and unique exactly when ``mac`` is not.
+# The macs that identify no hardware, so nothing may be identified by one. Both
+# are what unwritten storage reads back as -- zeroed memory and erased flash --
+# and the first is what a console reports for a hub whose mac it has not read
+# yet. Every hub mid-adoption on every console reports that same value, so a
+# scheme that accepted it as an identity would hand two different consoles one
+# id -- and would hand the hub itself a name it stops answering to the moment
+# the console fills the field in.
+#
+# These two and no more. A mac is a hardware address and "looks improbable" is
+# not grounds to refuse one: ``22:22:22:22:22:22`` is a well-formed, locally
+# administered unicast address a device may genuinely carry, and demoting a
+# console that reports one to weaker address-based keying would cost a real
+# install a stable identity in exchange for nothing anyone has seen. What these
+# two have in common is not that they look odd, it is that they are what a field
+# holds when no mac was ever written into it.
+UNUSABLE_MACS = frozenset({"000000000000", "ffffffffffff"})
 
-    Two keys rather than one is what lets a hub be followed while the console
-    changes either of them -- a re-adoption issues a new id and keeps the mac,
-    a mid-adoption snapshot answers before the mac is populated and fills it in
-    later, and a delta can null it back out. See ``HubDeviceIds``.
+
+def _mac_digits(text: str) -> str:
+    """``text`` reduced to the hex digits every spelling of a mac shares."""
+    return _MAC_SEPARATORS.sub("", text.lower())
+
+
+def mac_key(mac: Any) -> str | None:
+    """Reduce a mac to the identity it compares by, or None if it is not one.
+
+    ``mac`` arrives as an unvalidated ``data.get("mac", "")`` out of console
+    JSON, so three shapes have to be turned away before anything is keyed on it:
+    something that is not a string at all, something that is not a mac -- a hub
+    answering before the console filled the field in, or a field holding who
+    knows what -- and a mac every such console reports the same value for. All
+    three are one failure, an "identity" two different consoles would share, and
+    every caller answers it the same way: fall back to something weaker that is
+    at least its own.
+
+    This is the one place that decides what a mac is not, and every consumer
+    asks it: the identity a new hub is minted under (``device_identifier``), the
+    identity an entry is keyed on (``config_flow.console_unique_id``), and the
+    spelling a recorded identity also answers to (``identity_aliases``). Two
+    hubs that genuinely present one real mac is a different question, and
+    ``HubDeviceIds`` settles that one by contest.
     """
+    if not isinstance(mac, str):
+        return None
+    digits = _mac_digits(mac)
+    if len(digits) != _MAC_DIGITS or digits in UNUSABLE_MACS:
+        return None
+    return digits
+
+
+def names_hardware(identity: str) -> bool:
+    """Whether an identity names a hub at all, or is only a field nobody filled.
+
+    Two strings have been written into this integration's device registry that
+    identify no hardware: the empty string, which is what a release before
+    ``hub_keys`` filed a hub under when the console had not populated its mac,
+    and the placeholder macs every console mid-adoption reports (see
+    ``UNUSABLE_MACS``). Both are what an unwritten field reads back as, so every
+    console in the world offers the same one and no two installs can be told
+    apart by it.
+
+    They are still perfectly good *device identities* -- an install that already
+    holds one keeps it, because moving it would strand every entity registered
+    under it -- but they are no evidence about *which console* is in front of
+    us, and that is the one question they must never be allowed to answer. The
+    config flow's ownership test is where the difference bites: comparing an
+    entry's recorded identities against the console it is being pointed at, a
+    placeholder on both sides is two strangers reading as one hub, and a
+    placeholder on one side alone is an entry refused its own console forever.
+    Neither side offers one, so neither can happen.
+    """
+    return bool(identity) and _mac_digits(identity) not in UNUSABLE_MACS
+
+
+def identity_aliases(identity: str) -> tuple[str, ...]:
+    """The other spellings an identity already on disk may be met under.
+
+    A device row records the mac in whatever case the console used the day it
+    was written, and the same console is free to use the other one today --
+    ``AA:BB:CC:DD:EE:FF`` in one payload and ``aabbccddeeff`` in the next. Read
+    as two strings that is two devices, so a recorded mac answers to its
+    normalised form as well as to itself, and a recorded anything-else (a hub
+    id, a placeholder, the empty string) answers only to itself.
+    """
+    key = mac_key(identity)
+    return () if key is None or key == identity else (key,)
+
+
+def own_identities(identifiers: Iterable[Any], domain: str) -> tuple[str, ...]:
+    """The identities in a device row's ``identifiers`` that belong to ``domain``.
+
+    ``(domain, identity)`` is the shape of every identifier this integration
+    writes, and nothing enforces it on the way back in: the device registry
+    stores identifiers as JSON arrays and restores them with
+    ``{tuple(iden) for iden in device["identifiers"]}``, no arity check anywhere
+    (see ``device_registry.DeviceRegistry._async_load_data``). A hand-edited or
+    partially restored ``core.device_registry`` can therefore hold a one- or
+    three-element identifier, and ``for domain, identifier in row.identifiers``
+    raises ValueError on it.
+
+    Which is not a crash anybody sees. Raised inside platform setup it is caught
+    and logged, so the entry reports LOADED, publishes not one entity and leaves
+    three tracebacks behind; raised inside the config flow's ownership test it
+    takes a recovery flow down. Read by length instead, a malformed identifier
+    is simply not one of ours.
+    """
+    return tuple(
+        identifier[1]
+        for identifier in identifiers
+        if len(identifier) == 2 and identifier[0] == domain
+    )
+
+
+def hub_keys(hub: AlarmHub | None, hub_id: str) -> tuple[str, ...]:
+    """Every string this hub could already be recorded under, best evidence first.
+
+    Recognition, not minting -- ``device_identifier`` decides what a hub we have
+    never seen is called, and these are the strings that say we *have* seen it.
+    So the raw ``mac`` is offered whatever it looks like, including the two
+    shapes ``mac_key`` refuses and the empty string, because every one of them
+    has been written into a real user's device registry as an identity: the
+    released 0.2 filed a hub under ``data.get("mac", "")`` verbatim, so a
+    mac-less hub's device is on disk as ``(DOMAIN, "")`` and a hub adopted
+    mid-adoption is on disk as its placeholder. Refusing to recognise those is
+    not caution, it is minting a second device for hardware we already have
+    entities for -- and leaving the first set unavailable for good.
+
+    ``hub_id`` first, and always. The coordinator keys the snapshot by it, so it
+    names exactly one hub in any snapshot, while a mac only names one while the
+    console is telling the truth; on the one occasion the two disagree the id is
+    the one to believe. It is also the only key a non-string ``mac`` leaves --
+    a list is unhashable and raised ``TypeError`` inside
+    ``DeviceInfo(identifiers=...)``, failing platform setup outright.
+
+    Several keys rather than one is what lets a hub be followed while the
+    console changes any of them: a re-adoption issues a new id and keeps the
+    mac, a mid-adoption snapshot answers before the mac is populated and fills
+    it in later, a delta can null it back out, and the spelling can change
+    underneath all of that. See ``HubDeviceIds``.
+    """
+    keys = [hub_id]
     mac = hub.mac if hub is not None else None
-    if isinstance(mac, str) and mac:
-        return (mac, hub_id)
-    return (hub_id,)
+    if isinstance(mac, str):
+        keys.extend(key for key in (mac, mac_key(mac)) if key is not None)
+    return tuple(dict.fromkeys(keys))
 
 
 def device_identifier(hub: AlarmHub | None, hub_id: str) -> str:
-    """The identity a hub would be given if we had never seen it before.
+    """The identity a hub is minted under, having never been recorded before.
 
-    The mac whenever the console gives a usable one, which is the whole upgrade
-    contract: every unique_id in the integration is composed from this, and the
-    ones existing installs already hold were built from the raw mac.
+    Only ever reached past ``HubDeviceIds``, which offers an identity already in
+    the device registry first: what is on disk wins however odd it looks, and
+    this decides the rest. Two rules and no more -- the mac when the console
+    gives a usable one, the hub id when it does not.
+
+    The mac in the console's own spelling, not ``mac_key``'s normalisation of
+    it, even though ``mac_key`` is what decides whether there is one. The
+    released 0.2 built every identity and every unique_id from the raw string,
+    so minting it verbatim is what makes an upgrade a no-op *without needing
+    evidence*: the ids a hub gets on a registry we have never read are already
+    the ids that install holds. Normalising would make the upgrade contract
+    depend entirely on the seed being there, for the sole benefit of a console
+    that changes its spelling -- and that console is already handled, by
+    ``identity_aliases``, on the side where it costs nothing.
+
+    The hub id rather than an unusable mac is the whole of B2: a hub adopted
+    while the console still reported ``000000000000`` took the placeholder as
+    its identity, and the registry then recorded a string the hub stops
+    answering to the moment its real mac appears. On the next restart nothing
+    tied the two together and the hub got a second device, eleven registry
+    entries becoming twenty-two. A hub id is reported for the life of the
+    adoption, so an identity minted from one survives every restart -- and the
+    two macs that are not identities are reported by every console mid-adoption
+    alike, so a scheme that accepted one would hand two consoles the same id.
     """
-    return hub_keys(hub, hub_id)[0]
+    mac = hub.mac if hub is not None else None
+    if mac is not None and mac_key(mac) is not None:
+        return mac
+    return hub_id
 
 
 class HubDeviceIds:
@@ -258,21 +416,28 @@ class HubDeviceIds:
 
     Seeded from the identifiers already in the device registry, so the decision
     survives a restart: recomputing it from a snapshot that now carries a mac
-    would strand the id-based entities the last run created. Only the chosen
-    identity is recorded there, though, so the *other* keys a device has been
-    seen under are learned again from scratch each run -- a console that has
-    stopped reporting a mac entirely reconnects to its old, mac-named device
-    only for as long as this process lives.
+    would strand the id-based entities the last run created. That seed is the
+    first of the three rules identity is decided by, and it outranks the other
+    two -- an identity on disk wins whatever it looks like, a real mac, a
+    placeholder or the empty string, because what makes an install stable is not
+    that its identity is well-formed but that it does not move. ``hub_keys`` is
+    correspondingly generous about what it will recognise a hub by, for exactly
+    this reason.
+
+    Only the chosen identity is recorded there, though, so the *other* keys a
+    device has been seen under are learned again from scratch each run -- a
+    console that has stopped reporting a mac entirely reconnects to its old,
+    mac-named device only for as long as this process lives.
 
     A key is only worth following while it names one hub, and ``mac`` does not
-    always: a console mid-adoption reports the placeholder ``000000000000``, and
-    a console bug can repeat a real one. Both hubs then resolved to the same
-    identity, so the second got no entities at all -- every unique_id was
-    already taken -- and the surviving set read whichever hub ``find`` reached
-    first, which is REST list order. An entity confidently reporting a different
-    physical hub's zone is worse than either hub being missing, so an identity
-    belongs to exactly one hub id, and a second hub presenting a mac that is
-    already claimed falls back to its own id.
+    always: a console bug can repeat a real one, and every console mid-adoption
+    reports the same placeholder. Both hubs then resolved to the same identity,
+    so the second got no entities at all -- every unique_id was already taken --
+    and the surviving set read whichever hub ``find`` reached first, which is
+    REST list order. An entity confidently reporting a different physical hub's
+    zone is worse than either hub being missing, so an identity belongs to
+    exactly one hub id, and a second hub presenting a key that is already
+    claimed falls back to its own id.
 
     "Already claimed" has to mean *by a hub that is still here*, or the fix
     would break the case the scheme exists for: a re-adoption is precisely a mac
@@ -280,19 +445,61 @@ class HubDeviceIds:
     is meant to hold together. So the claim is only contested while the hub that
     made it is in the same snapshot -- which is what ``observe`` is for, and why
     the reconcile pass hands over the whole snapshot before anything is built.
-    That is a rule for *minting* an identity, and only that: looking one up goes
-    by the owner recorded here rather than by who is live, or the crossing comes
-    back the moment the owner misses a snapshot. See ``find``.
+    A key that names no hardware is the exception, and ``_claimed_elsewhere``
+    says why. That is a rule for *minting* an identity, and only that: looking
+    one up goes by the owner recorded here rather than by who is live, or the
+    crossing comes back the moment the owner misses a snapshot. See ``find``.
 
-    The honest limit is a hub with no usable mac. Its only key is its id, so a
-    re-adoption there really is a new device to us and the old entities stay
-    unavailable until the user removes them. Nothing in the payload survives
-    the change to tie the two together, and a looser match would merge hubs
-    that are not the same hardware.
+    The contest is on the identity a key leads to, never on the key alone --
+    including the hub's own id, which is the one key no other hub can present
+    and was for that reason exempted outright. Two live hubs shared one identity
+    straight through the exemption: B takes mac M; B misses a snapshot and C,
+    reporting M, is read as B re-adopted and takes M over; B comes back, its mac
+    is contested and dropped, but its own id still pointed at M and the
+    exemption waved it through. Both resolved to M -- one device row for two
+    live hubs, an entity built and named for B publishing C's zone while B's own
+    zone read normal. That an id names one hub is a fact about the key, and the
+    failure was never about the key.
+
+    Two limits are deliberate rather than fixed.
+
+    A hub with no usable mac has only its id, so a re-adoption there really is a
+    new device to us and the old entities stay unavailable until the user
+    removes them. Nothing in the payload survives the change to tie the two
+    together, and a looser match would merge hubs that are not the same
+    hardware.
+
+    And the seed puts identities that name no hardware into ``_by_key`` while
+    deliberately leaving ``_owner`` empty, so at process start such a row has no
+    owner and any hub offering that string can resolve onto it. That is what
+    carries a pre-0.3 install -- a row filed under ``""`` or the placeholder --
+    back onto its own hub, and it is the one place preferring the registry
+    widens the surface rather than narrowing it: if the true owner is missing
+    from the first snapshot after a restart, a *different* mid-adoption hub
+    inherits the row and its eleven entity unique_ids. There is nothing in
+    either payload to tell the two apart, and refusing the match instead would
+    strand the upgrade it exists for, so the trade is taken knowingly.
+    ``entity.async_migrate_hub_identity`` is what shrinks it: on the single-hub
+    installs that make up nearly all of that population it rewrites the row to
+    an identity that does name hardware, once, and after that there is nothing
+    left for a stranger to inherit. What remains exposed is an entry that holds
+    a second device row, where the migration refuses to guess.
     """
 
     def __init__(self, known: Iterable[str] = ()) -> None:
-        self._by_key: dict[str, str] = {key: key for key in known}
+        recorded = list(known)
+        # Each recorded identity answers to itself and to the other spelling a
+        # mac can be met in, so a console that changes its mind about case finds
+        # the device it already has rather than minting a second one. Aliases go
+        # in first and exact spellings overwrite them: on the pathological
+        # install that somehow holds both spellings as two rows, a hub reporting
+        # one of them must reach that row and not the other.
+        self._by_key: dict[str, str] = {
+            alias: identity
+            for identity in recorded
+            for alias in identity_aliases(identity)
+        }
+        self._by_key.update({identity: identity for identity in recorded})
         # Which hub id each identity currently belongs to, and which hub ids the
         # last snapshot carried. Neither is seeded from the registry: it records
         # the identities that were decided, not the ids they were decided for.
@@ -318,11 +525,20 @@ class HubDeviceIds:
     def resolve(self, hub: AlarmHub | None, hub_id: str) -> str:
         """This hub's device identity, minting one only if it is genuinely new.
 
-        Keys another live hub has claimed are dropped first, so the lookup and
-        the mint below both work from the keys that name *this* hub. The lookup
-        then reads them id first: a hub id is unique to one hub by construction,
-        while a mac is only unique when the console is telling the truth, so on
-        the one occasion the two disagree the id is the one to believe.
+        The three rules, in order. Keys leading to a device another hub has the
+        better claim to are dropped first, so everything below works from the
+        keys that answer for *this* hub; what is left is looked up against the
+        registry seed and whatever this process has learned since, best evidence
+        first (see ``hub_keys``); and only a hub nothing answers for is minted,
+        under ``device_identifier``.
+
+        The mint is taken only if it survived the contest, which is what stops
+        the second of two hubs sharing a mac from minting the identity the first
+        one is already using. Every key can be dropped -- a hub whose id and mac
+        both lead to a device that has moved on has nothing left to answer for
+        it -- and the hub id is then the identity, which is what
+        ``device_identifier`` would mint for it anyway and is a string no other
+        hub reports.
 
         Only keys nobody has resolved before are recorded. A key that already
         answers is answering for a device that exists, and re-pointing it is how
@@ -335,28 +551,58 @@ class HubDeviceIds:
             for key in hub_keys(hub, hub_id)
             if not self._claimed_elsewhere(key, hub_id)
         ]
+        minted = device_identifier(hub, hub_id)
         device_id = next(
-            (self._by_key[key] for key in reversed(keys) if key in self._by_key),
-            keys[0],
+            (self._by_key[key] for key in keys if key in self._by_key),
+            minted if minted in keys else hub_id,
         )
         self._owner[device_id] = hub_id
         for key in keys:
             self._by_key.setdefault(key, device_id)
+        # A hub id names one hub for the life of the adoption, so it points at
+        # that hub's identity *now* -- including an identity just minted because
+        # the one it used to point at has been taken over. ``setdefault`` above
+        # cannot do that: the stale mapping is precisely what it preserves, and
+        # the key is dropped from ``keys`` in that case anyway. Keeping it in
+        # step is what makes "this hub's own id leads somewhere else" mean the
+        # takeover happened rather than merely that a poll went oddly, and
+        # ``find`` reads it -- an owner none of whose keys lead to its own
+        # device is a device nothing answers for.
+        self._by_key[hub_id] = device_id
         return device_id
 
     def _claimed_elsewhere(self, key: str, hub_id: str) -> bool:
-        """Whether ``key`` resolves to a device another hub in the snapshot owns.
+        """Whether ``key`` resolves to a device another hub has the better claim to.
 
-        A hub's own id is never contested. The coordinator keys the snapshot by
-        it, so it names exactly one hub in any snapshot -- which is what leaves
-        every hub one key of its own to fall back on, and why the filter above
-        can never come back empty.
+        Asked of the *identity* the key leads to, and of every key alike. A
+        hub's own id used to be exempted outright, on the sound observation that
+        the coordinator keys the snapshot by it so no other hub can present one
+        -- and two live hubs shared an identity straight through that exemption,
+        because what the id led to had been taken over while the hub was away
+        (see the class docstring). No other hub presenting a key does not make
+        the device behind it still ours.
+
+        For a key that names hardware the claim only stands while its owner is
+        in the same snapshot, because a mac turning up under a second id with
+        the first id gone is a re-adoption, which is the case this whole scheme
+        exists to follow. A key that names no hardware is never that: the
+        placeholder and the empty string are what every console reports for
+        every hub it has not read yet, so a second hub carrying one is never
+        evidence that it is the first hub back under a new name. There the claim
+        stands whether or not its owner is still here, and the newcomer mints
+        its own identity rather than inheriting eleven entities describing
+        somebody else's hardware.
+
+        An unowned identity is never claimed, which is what the registry seed
+        relies on and what ``resolve`` needs to be able to take an identity back
+        after a restart -- and, for a key that names no hardware, is the trade
+        the class docstring sets out.
         """
-        if key == hub_id:
-            return False
         device_id = self._by_key.get(key)
         owner = self._owner.get(device_id) if device_id is not None else None
-        return owner is not None and owner != hub_id and owner in self._live
+        if owner is None or owner == hub_id:
+            return False
+        return owner in self._live or not names_hardware(key)
 
     def find(
         self, hubs: Mapping[str, AlarmHub], device_id: str
