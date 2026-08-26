@@ -1,3 +1,8 @@
 pytest
 pytest-homeassistant-custom-component
+# Enforces the suite-wide ``timeout`` in pyproject.toml. It currently arrives
+# via pytest-homeassistant-custom-component, but that is its dependency to drop:
+# unpinned there and absent here, the bound would vanish silently and hangs
+# would go back to wedging CI.
+pytest-timeout
 ruff

@@ -23,7 +23,7 @@ async def test_setup_and_unload(hass):
     entry = _entry()
     entry.add_to_hass(hass)
 
-    async def _block(_cb):
+    async def _block(_cb, _on_connected=None):
         await asyncio.Event().wait()  # stay "connected" until cancelled
 
     with patch("custom_components.unifi_protect_alarm_hub.AlarmHubApiClient") as cls:
@@ -45,7 +45,7 @@ async def test_setup_starts_ws_listener(hass):
         cls.return_value.async_get_alarm_hubs = AsyncMock(return_value=[])
         subscribed = asyncio.Event()
 
-        async def fake_subscribe(_cb):
+        async def fake_subscribe(_cb, _on_connected=None):
             subscribed.set()
             await asyncio.Event().wait()  # stay "connected" until cancelled
 
@@ -59,6 +59,33 @@ async def test_setup_starts_ws_listener(hass):
         assert cls.return_value.async_subscribe_devices.await_count >= 1
 
         # Unload must cancel the WS task cleanly (no error raised).
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+
+
+async def test_setup_takes_a_single_snapshot(hass):
+    """Setup polls, then the socket connects: that connect must not poll again.
+
+    A resync is for a RE-connect, where frames were missed while the socket was
+    down. On the first one the snapshot setup just took is still current.
+    """
+    entry = _entry()
+    entry.add_to_hass(hass)
+    with patch("custom_components.unifi_protect_alarm_hub.AlarmHubApiClient") as cls:
+        cls.return_value.async_get_alarm_hubs = AsyncMock(return_value=[])
+
+        async def fake_subscribe(_cb, on_connected=None):
+            if on_connected is not None:
+                on_connected()
+            await asyncio.Event().wait()  # stay "connected" until cancelled
+
+        cls.return_value.async_subscribe_devices = AsyncMock(side_effect=fake_subscribe)
+
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        assert cls.return_value.async_get_alarm_hubs.await_count == 1
+
         assert await hass.config_entries.async_unload(entry.entry_id)
         await hass.async_block_till_done()
 

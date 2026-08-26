@@ -10,7 +10,7 @@ dependency. It therefore runs side by side with the official UniFi Protect
 integration without any shared-library version conflict, on any recent Home
 Assistant.
 
-> **v0.1 — needs real-world validation against hardware.** Built against the
+> **v0.3 — still being validated against real hardware.** Built against the
 > documented public alarm-hub API. Please file issues with debug logs.
 
 ## Requirements
@@ -44,15 +44,25 @@ enable them in the entity settings if wired.
 
 ## How updates work
 Updates are **real-time**. The integration subscribes to the Protect devices
-WebSocket (`/subscribe/devices`); when the alarm hub reports a change (zone
-opened, output triggered, tamper, armed state, etc.) it triggers an immediate
-refresh of full hub state, so entities update within about a second.
+WebSocket (`/subscribe/devices`); each frame carries the fields that changed
+(zone opened, output triggered, tamper, armed state, etc.) and is applied
+straight to the hub's state, so entities change at the moment the hub reports
+it.
 
-REST polling still runs every **5 minutes** as a fallback safety net (and for
-the initial load), so state stays correct even if the WebSocket drops. The
-WebSocket reconnects automatically with exponential backoff, and a connection
-failure never blocks setup — the integration loads on the first REST refresh and
-adds the WebSocket on top.
+Applying the frame — rather than treating it as a hint to re-read the whole hub
+over REST — is what makes brief events survive. A door that opens and closes in
+three seconds produces two state changes at the right times, which a re-read
+would miss: by the time it ran, the zone would read closed again, as if nothing
+had happened.
+
+REST polling runs every **5 minutes** as a reconciling fallback (and for the
+initial load), and a reconnect resyncs in full, so nothing that happened while
+the socket was down is left stale. The WebSocket is kept alive with a 30-second
+heartbeat and reconnects with exponential backoff; a connection failure never
+blocks setup — the integration loads on the first REST refresh and adds the
+WebSocket on top. A drop is logged at **warning** level so a silent fall back
+to 5-minute polling is visible in the log (the retries that follow stay at
+debug).
 
 ## Troubleshooting
 Enable debug logging:
@@ -64,6 +74,20 @@ logger:
 If no entities appear, confirm an Alarm Hub is adopted in UniFi Protect and that
 the API key has Protect read access.
 
+**A zone reads backwards (open when the door is shut).** Check the zone's
+contact type in UniFi Protect — a **normally closed** (NC) contact configured as
+normally open, or the reverse, inverts the status the hub reports, and this
+integration shows exactly what the hub reports. This turned out to be the cause
+in [#2](https://github.com/hughwf/hass-unifi-protect-alarm-hub/issues/2), where
+the wording of the Protect setting was easy to read the wrong way round: fix it
+on the hub and the entity follows. The raw value is on the entity's `status`
+attribute (`normal` / `alarm`) if you want to confirm what is arriving.
+
+**A state change never reached Home Assistant.** Check the log for a WebSocket
+warning: while the socket is down, state only refreshes every 5 minutes, so a
+short zone pulse can pass unseen. It should reconnect on its own — please file
+an issue with debug logs if it does not.
+
 ## Status
-v0.1 — built against the public alarm-hub API and validated with mocked data;
-needs real-world testing. Please report issues with debug logs.
+v0.3 — built against the public alarm-hub API and validated with mocked data;
+still wants real-world testing. Please report issues with debug logs.

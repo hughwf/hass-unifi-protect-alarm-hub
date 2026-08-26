@@ -1,3 +1,12 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Much of this suite exercises cancellation and task teardown, where a
+# regression does not fail -- it waits. A swallowed CancelledError parks
+# ``async_shutdown``'s ``await self._ws_task``; a connect callback that stops
+# firing parks a test on its own Event. Without a bound, CI hangs until the job
+# limit kills it and names no test; with one, each such hang is a single
+# reported failure carrying the stack it was stuck in. The whole suite runs in
+# well under a second against fakes, so this sits orders of magnitude above the
+# slowest test and a loaded runner cannot reach it by being slow.
+timeout = 60
