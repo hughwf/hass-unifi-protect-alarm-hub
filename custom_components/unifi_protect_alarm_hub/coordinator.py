@@ -447,8 +447,11 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
         correct it — and it is also the log-once guard, so resetting it turns
         one standing REST outage into an error line per failed poll. Staying
         available while push is live is an entity-level statement ("the socket
-        is delivering"), not a claim that a poll succeeded; expressing it
-        belongs in entity.py, which a later stage owns.
+        is delivering"), not a claim that a poll succeeded, so entity.py is
+        where it is expressed: ``AlarmHubBaseEntity.available`` falls back to
+        how recently state was delivered *for its own hub*, for one poll
+        interval, and arms a timer so a socket that goes quiet retires the
+        reading rather than stranding it on screen.
         """
         self.data = hubs
         self.async_update_listeners()
