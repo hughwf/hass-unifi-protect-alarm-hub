@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import aiohttp
 import pytest
@@ -678,3 +679,33 @@ def test_ws_close_reason_prefers_a_recorded_exception():
     exc = aiohttp.ServerTimeoutError("No PONG received after 15.0 seconds")
     reason = ws_close_reason(aiohttp.WSCloseCode.ABNORMAL_CLOSURE, exc)
     assert "No PONG received" in reason
+
+
+async def test_a_frame_is_logged_before_anything_interprets_it(caplog):
+    """The console's own words, so an issue report can settle the frame shape.
+
+    Everything downstream is an interpretation. If the merge ever disagrees with
+    real hardware, this line is the evidence, so it has to be what arrived
+    rather than what we made of it.
+    """
+    raw = '{"type": "update", "item": {"id": "x", "modelKey": "linkstation"}}'
+    session = _WSFakeSession([_text(raw)])
+
+    with caplog.at_level(
+        logging.DEBUG, logger="custom_components.unifi_protect_alarm_hub.api"
+    ):
+        await _client(session).async_subscribe_devices(lambda _frame: None)
+
+    assert raw in caplog.text
+
+
+async def test_a_snapshot_is_logged_for_the_same_reason(caplog):
+    payload = [{"id": "ah1", "mac": "M", "isAlarmHub": True, "alarmHub": {}}]
+    client = _client(_FakeSession(_FakeResp(200, payload)))
+
+    with caplog.at_level(
+        logging.DEBUG, logger="custom_components.unifi_protect_alarm_hub.api"
+    ):
+        await client.async_get_alarm_hubs()
+
+    assert "ah1" in caplog.text

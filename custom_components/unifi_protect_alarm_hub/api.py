@@ -188,6 +188,8 @@ class AlarmHubApiClient:
         letting HA hold the last known state.
         """
         data = await self._request("GET", "/v1/alarm-hubs")
+        # The other half of the shape question: what a delta is merged *into*.
+        _LOGGER.debug("Alarm-hub snapshot: %s", data)
         if not isinstance(data, list):
             raise AlarmHubConnectionError(
                 f"Expected a list from /v1/alarm-hubs, got {type(data).__name__}"
@@ -260,6 +262,13 @@ class AlarmHubApiClient:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 frame = alarm_hub_frame(msg.data)
                 if frame is not None:
+                    # Logged before anything interprets it: the whole delta path
+                    # rests on the console sending the same field shape as the
+                    # REST snapshot, and this is the only place that assumption
+                    # can be checked against real hardware. The README asks for
+                    # debug logs on an issue; this is what makes them worth
+                    # asking for.
+                    _LOGGER.debug("Alarm-hub frame: %s", msg.data)
                     _isolate("frame", lambda: on_alarm_hub_frame(frame))
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 # Where a heartbeat timeout lands, as a ServerTimeoutError:
