@@ -1,3 +1,33 @@
-pytest
-pytest-homeassistant-custom-component
-ruff
+# Every version here is pinned, because one of these packages decides which
+# Home Assistant the suite runs against and another decides which lint rules
+# exist.
+#
+# pytest-homeassistant-custom-component ships one exact Home Assistant per
+# release -- 0.13.316 is homeassistant==2026.2.3 -- and cuts a new release for
+# every Home Assistant release. Unpinned, the version under test changes on
+# whatever night upstream ships, so a green run does not record which version
+# it was green on, a red one can land in a pull request that touched nothing,
+# and CI drifts away from the venv the tests were written in. It also pins
+# pytest and every pytest plugin it needs, which is why pytest is not listed
+# here separately.
+#
+# The oldest Home Assistant this integration supports is exercised by its own
+# job, which overrides this pin -- see .github/workflows/ci.yml.
+pytest-homeassistant-custom-component==0.13.316
+
+# Enforces the suite-wide ``timeout`` in pyproject.toml. It currently arrives
+# via pytest-homeassistant-custom-component, but that is its dependency to drop:
+# unpinned there and absent here, the bound would vanish silently and hangs
+# would go back to wedging CI.
+pytest-timeout==2.4.0
+
+# Pinned for the reason above and one of its own: ruff adds and tightens rules
+# in most releases, so an unpinned ruff fails a pull request over code it did
+# not touch, on a rule that did not exist when the branch was cut. Moving this
+# is a commit that also fixes or reformats whatever the new rules find.
+#
+# Which rules those are is chosen in ``[tool.ruff.lint]`` in pyproject.toml.
+# Until that table existed this pin was guarding a rule set nobody had picked --
+# ruff's default E4/E7/E9/F and nothing else -- so the sentence above described
+# a risk the repository was not actually exposed to.
+ruff==0.15.20

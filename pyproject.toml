@@ -1,3 +1,109 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Much of this suite exercises cancellation and task teardown, where a
+# regression does not fail -- it waits. A swallowed CancelledError parks
+# ``async_shutdown``'s ``await self._ws_task``; a connect callback that stops
+# firing parks a test on its own Event. Without a bound, CI hangs until the job
+# limit kills it and names no test; with one, each such hang is a single
+# reported failure carrying the stack it was stuck in. The whole suite runs in
+# well under a second against fakes, so this sits orders of magnitude above the
+# slowest test and a loaded runner cannot reach it by being slow.
+timeout = 60
+
+[tool.ruff]
+# With no configuration at all, ruff enforces only its default E4/E7/E9/F --
+# broadly "syntax errors, bad imports and undefined names". Nothing this
+# integration actually cares about was being checked, which is how a
+# ``# noqa: BLE001`` naming a rule that had never been enabled survived in
+# config_flow.py, and why requirements_test.txt pins ruff against rule churn
+# that could not reach this tree.
+#
+# ``target-version`` is set rather than inferred: ruff takes it from
+# ``project.requires-python``, this file declares no ``[project]`` table, and an
+# unset value falls back to ruff's own default -- which drifts on its own
+# schedule. Home Assistant 2025.11.0, the floor hacs.json promises, requires
+# Python >=3.13.2, so py313 is the oldest interpreter a supported install runs.
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+# Every family below already passes over custom_components, tests and
+# conftest.py -- each was run against the tree before being added here. Rules
+# the code would have to change to satisfy are deliberately absent, so this is a
+# record of the standard the code already holds, not a to-do list that lands CI
+# red on someone else's pull request.
+select = [
+  "A", # a local shadowing a builtin
+  # This integration is async end to end. A blocking call does not slow one
+  # entry down, it stalls the event loop for every integration in the install,
+  # and it is invisible until someone's whole dashboard goes unresponsive.
+  "ASYNC",
+  # switch.py and entity.py take datetimes from HA's timer callbacks, and a
+  # naive one built anywhere near them is the classic Home Assistant bug: it
+  # reads as UTC on the server and as local time to the user.
+  "DTZ",
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "FA", # missing `from __future__ import annotations`
+  # Logging built with f-strings or % formats the message even when the level
+  # is disabled -- paid on every frame the WebSocket delivers, not just the
+  # ones anyone reads.
+  "G",
+  "I",   # import sorting
+  "LOG", # logging misuse
+  # The rule family that would have caught the ``# noqa: BLE001`` below: a
+  # directive that names no code at all. It does not catch one naming a code
+  # that is simply not enabled -- that is RUF100, and see the note further down
+  # for why it is not on yet.
+  "PGH",
+  "PIE", # misc simplifications
+  "PTH", # os.path where pathlib belongs
+  "RET", # return-statement cleanups
+  "RSE", # redundant parentheses on a raise
+  "T20", # an integration logs, it does not print
+  "TID", # banned and relative imports
+  "W",   # pycodestyle warnings
+  "YTT", # version checks that break past 3.9 -- this repo has a Python floor
+]
+
+ignore = [
+  # ``ruff format`` owns line length, and the two disagree on exactly one line
+  # in the tree: a 90-character sentence inside a models.py docstring, which the
+  # formatter leaves alone because it does not rewrap prose. Enforcing both
+  # would mean a permanently red lint over a line the formatter calls correct.
+  # Re-wrap that docstring and this ignore can go.
+  "E501",
+]
+
+# Notes on the rules that took a decision, recorded so the next person does not
+# have to rediscover them. The first two are worth having and are off only
+# because a Python file would have to change first -- a line each, in files this
+# table does not own:
+#
+#   BLE   blind ``except Exception``. This is the family the stray
+#         ``# noqa: BLE001`` in config_flow.py was written for. Turning it on
+#         reports exactly one site: coordinator.py's WebSocket retry loop, which
+#         catches everything on purpose to turn it into a ``reason`` string and
+#         keep reconnecting. It wants a ``# noqa: BLE001`` of its own -- and the
+#         one in config_flow.py wants deleting, because that handler re-raises
+#         and BLE001 does not fire on a re-raising handler at all.
+#   RUF100  unused ``# noqa``. The rule that would have flagged the dead
+#         directive above on the day it was written, and would stop the next one
+#         landing. It cannot go on while that directive is still there, because
+#         it is itself the thing RUF100 reports.
+#   E501  see the ignore above -- one 90-character docstring line.
+#   I     already on, but only because [tool.ruff.lint.isort] below tells ruff
+#         what is first-party; without that it misreads four test files.
+#
+# Larger families were considered and rejected as too big to land here: D (198
+# hits, nearly all undocumented test functions), S (631, asserts in tests),
+# COM (132, and it fights the formatter), SLF (67, tests reaching into private
+# attributes by design), PL/FBT/EM/ARG/TRY/INP, plus single hits from B, SIM,
+# UP, C4, N, C901 and PT.
+
+[tool.ruff.lint.isort]
+# ``platform_common`` is a module inside tests/, and ``custom_components`` is
+# this repository. Left to guess, ruff files both under third-party and reports
+# the existing -- correct -- grouping as unsorted.
+known-first-party = ["custom_components", "platform_common"]

@@ -17,8 +17,12 @@ PLATFORMS: list[Platform] = [
 DEFAULT_PORT = 443
 DEFAULT_VERIFY_SSL = False
 
-# WebSocket push is the primary update path (v0.2); REST polling is a fallback
-# safety net and the initial load, so it can be infrequent.
+# The WebSocket is the primary *trigger* and REST the primary *source*: on the
+# hardware this has been measured against, every alarm-hub frame is a bare
+# timestamp, so the socket says when to read and REST says what changed. This
+# poll is neither -- it is the reconciling fallback (and the initial load),
+# covering a frame that never arrived and a socket that is down, so it can be
+# infrequent.
 SCAN_INTERVAL = timedelta(minutes=5)
 
 MANUFACTURER = "Ubiquiti"

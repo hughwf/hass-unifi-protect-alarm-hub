@@ -1,16 +1,161 @@
 name: CI
+
+# An unfiltered ``push`` ran all four jobs on every branch anyone pushed, and
+# then ran them again when that branch opened a pull request from this same
+# repository -- two identical runs per push, for the whole life of the branch.
+# Branch work is covered from the moment it opens a pull request, and main is
+# covered on the merge, so those are the two triggers worth paying for.
 on:
   push:
+    branches: [main]
   pull_request:
+
+# A newer push to a pull request makes the run already in flight redundant --
+# without this they both run to completion and the stale one can be the last to
+# report. Pushes to main are deliberately excluded: people are installing from
+# this repository, so every commit that reaches the default branch should end up
+# with a CI result of its own rather than being cancelled by the commit after it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The HACS job reads this repository back through the GitHub API with the job
+# token. Nothing in this workflow writes anything, so say so.
+permissions:
+  contents: read
+
+# Third-party actions are pinned by commit SHA. A tag is a mutable pointer its
+# owner can move at any time, so ``@v4`` states an intent rather than naming the
+# code that will run; a SHA is the code. The trailing comment on each is the
+# release the SHA was resolved from -- move the two together or the comment
+# starts lying. Note the two container actions below, where the SHA freezes the
+# action definition but not the image it runs.
+
 jobs:
   lint-and-test:
+    name: Lint and test (HA 2026.2.3)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          # Not free to change: homeassistant 2026.2.3 requires 3.13.2 or
+          # newer, and 2026.3 raised that to 3.14. Moving this alone silently
+          # changes which Home Assistant pip is able to resolve.
+          python-version: "3.13"
+      - run: pip install -r requirements_test.txt
+      # ``.``, not a directory list. Naming custom_components and tests left
+      # everything in the repository root unlinted -- conftest.py above all,
+      # which is imported by every test run. Appending ``import  os ,sys`` and
+      # ``BAD=  1;OTHER=2`` to it kept both commands exiting 0 while E401, F401
+      # and E702 sat in the file. The lint scope should be the repository.
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -v
+
+  test-oldest-supported:
+    name: Test (HA 2025.11.0, the floor hacs.json promises)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
       - run: pip install -r requirements_test.txt
-      - run: ruff check custom_components tests
-      - run: ruff format --check custom_components tests
+      # HACS refuses to install below the version in hacs.json, so this is the
+      # oldest Home Assistant a user of this integration can be running, and
+      # nothing else here goes near it -- the job above tests one version, and
+      # a newer one. The two do not agree: on 2025.10 the delta-buffer tests
+      # fail, because DataUpdateCoordinator only started taking the
+      # request-refresh debouncer's lock on every refresh path in 2025.11, and
+      # the buffer's "one follow-up per request that lost a delta" guarantee is
+      # built on that serialisation.
+      #
+      # 0.13.294 is the pytest-homeassistant-custom-component release that pins
+      # homeassistant==2025.11.0. pycares has to come with it: 2025.11 pins
+      # aiodns==3.5.0, whose own pycares requirement has no upper bound, and
+      # pycares 5 removed a name aiodns 3.5.0 reads at import time -- left to
+      # resolve freely, pip builds an environment that cannot import Home
+      # Assistant at all. Nobody's actual install has this problem; Home
+      # Assistant ships a constraints file that we, installing it from PyPI,
+      # do not.
+      - run: pip install "pytest-homeassistant-custom-component==0.13.294" "pycares==4.9.0"
+      # A resolve that quietly left the newer Home Assistant in place would
+      # make this job a second copy of the one above, and it would pass.
+      #
+      # Not an ``assert``: the interpreter erases those under ``python -O`` or a
+      # ``PYTHONOPTIMIZE`` in the environment, and this step exists precisely to
+      # be the thing that notices. An erased check exits 0 and the job goes back
+      # to silently testing whatever pip happened to install. ``sys.exit`` with
+      # a message is not removable, and prints the version it actually found.
+      - run: |
+          python - <<'PY'
+          import sys
+
+          import homeassistant.const as ha
+
+          if ha.__version__ != "2025.11.0":
+              sys.exit(f"expected Home Assistant 2025.11.0, got {ha.__version__}")
+          print(f"Home Assistant {ha.__version__} confirmed")
+          PY
       - run: pytest -v
+
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # Home Assistant's own manifest validator. The suite does not stand in
+      # for it: an iot_class typo and a documentation value that is not a URL
+      # both pass every test in this repository, and the second is enough on
+      # its own for HACS to reject the download.
+      #
+      # The SHA is a commit on master, because master is the only branch that
+      # carries a usable action: the repository's one tag, 1.0.0 (April 2020),
+      # does have a hassfest/ directory, but it holds a Dockerfile and an
+      # entrypoint.sh and no action.yml, so ``@1.0.0`` will not resolve as an
+      # action at all.
+      #
+      # Pinning stops here, and not by oversight. The action is a composite that
+      # shells out to ``docker run ghcr.io/home-assistant/hassfest`` with no tag
+      # on the image, so it is ``:latest`` and it moves. The SHA freezes the
+      # wrapper -- nobody can repoint that image or bolt on a step without the
+      # SHA changing -- but the validator inside the container is whatever was
+      # published most recently, and no edit in this repository can change that.
+      - uses: home-assistant/actions/hassfest@a7c616ce81ccda50150bf1595786c71b1883fabb # master branch, 2026-08-03
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      # No checkout: this action reads the repository through the GitHub API,
+      # at the head branch of a pull request or at the ref of a push. It is the
+      # only thing that reads hacs.json, which hassfest ignores and which HACS
+      # parses under a schema that rejects unknown keys.
+      #
+      # Same shape as hassfest, and the same limit. This repository does publish
+      # tags, but the newest is 22.5.0 from May 2022 and HACS's own rules have
+      # moved a long way since, so a run against it would be checking something
+      # nobody is enforcing. The SHA below is a commit on main; the action
+      # declares ``image: docker://ghcr.io/hacs/action:main``, so the container
+      # still floats and cannot be pinned from here. The SHA is still worth
+      # having: it is what stops the action definition itself -- the thing
+      # handed a token -- from changing under the workflow.
+      - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # main branch, 2026-06-08
+        with:
+          category: integration
+          # A comment on the pull request would need write access this
+          # workflow does not grant. The job log carries the same output.
+          comment: false
+          # These three are about being listed in the default HACS store, not
+          # about whether this repository installs, and each fails today for a
+          # reason no file in this repository can fix:
+          #   brands  - the domain is not in home-assistant/brands, and there
+          #             is no custom_components/unifi_protect_alarm_hub/brand/
+          #             icon.png to satisfy the check locally
+          #   topics  - the GitHub repository has no topics set
+          #   license - the repository has no LICENSE file, so GitHub reports
+          #             no SPDX id for it
+          # Each is a small change made somewhere other than here. Delete the
+          # word from this list as each one lands.
+          ignore: brands topics license
