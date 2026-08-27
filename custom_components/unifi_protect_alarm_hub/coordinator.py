@@ -1,24 +1,46 @@
 """Data update coordinator for the UniFi Protect Alarm Hub.
 
 Real-time updates come from the Protect devices WebSocket (see
-``AlarmHubApiClient.async_subscribe_devices``): an alarm-hub frame is applied
-straight to the cached state, so every edge the hub reports reaches entities at
-the moment it happens. REST polling at ``SCAN_INTERVAL`` is the reconciling
-fallback (and the initial load), and a reconnect resyncs in full.
+``AlarmHubApiClient.async_subscribe_devices``), and a frame arrives as one of
+two things. A frame that carries hub state is a delta: it is merged into the
+cache and published synchronously, so every edge it describes reaches entities
+at the moment it was reported, with no request at all. A frame that carries
+none is a notification -- it says something happened on that hub and nothing
+whatever about what -- and the only way to learn what is to read the hub over
+REST, promptly, while whatever tripped is still tripped. That is not the
+degenerate case it sounds like: on the one UP-AlarmHub-Kit console anyone has
+measured it is *every* frame, a bare ``lastEvent`` timestamp beside the id.
+REST polling at ``SCAN_INTERVAL`` is the reconciling fallback (and the initial
+load), and a reconnect resyncs in full.
 
 Push and poll race, so the two paths are kept from overwriting each other. A
 snapshot describes the console as it was when its request went out, which makes
-any frame that lands while it is in flight newer than the reply: those frames
-are buffered and replayed over the snapshot before it is published. And a
-pushed update never touches the poll schedule, because the poll is what heals a
-frame we never received -- a chatty hub must not be able to postpone it.
+anything that lands while it is in flight newer than the reply -- and the two
+kinds of frame need different things done about that. A delta is buffered and
+replayed over the snapshot before it is published. A notification has no state
+in it to replay; what it has is a claim that the console moved on after the
+request went out, so the reply cannot be its answer and a read of its own is
+still owed. Both are settled from the same ``finally``, on every ending the
+request has -- though "settled" means the next read is *considered*, not that a
+lost event is recovered: a notification read that itself fails clears the claim
+without answering it, and the event waits for the next frame or the poll.
+Released v0.2 lost it the same way, and by the time a retry could land the pulse
+it reported is over.
+
+A *delta* never touches the poll schedule, because the poll is what heals a
+frame we never received -- a chatty hub must not be able to postpone it. A
+notification does postpone it, and has to: it is answered by a full snapshot,
+and re-arming the timer after one is the same thing the poll path does when it
+takes one. Each postponement is a snapshot, so nothing goes unreconciled.
 
 A frame the cache cannot absorb falls back to a snapshot, and how eagerly
 depends on whether the thing that caused it will ever stop. A hub being adopted
-or removed happens once and is settled by one request. An id we do not hold, a
-payload in a shape we cannot parse, a frame type this integration was not
-written against: those are properties of the console rather than events -- each
-repeats for every frame it ever sends -- so they share a throttle.
+or removed happens once and is settled by one request. A notification happens
+once too, but its answer expires while you wait, so it is read at once and
+coalesced rather than throttled (see ``NOTIFY_READ_COOLDOWN``). An id we do not
+hold, a payload in a shape we cannot parse, a frame type this integration was
+not written against: those are properties of the console rather than events --
+each repeats for every frame it ever sends -- so they share a long throttle.
 """
 
 from __future__ import annotations
@@ -62,17 +84,73 @@ WS_WARN_REARM_UPTIME = 300.0
 # How many deltas to hold while a REST request is in flight. The window is one
 # round trip, so this is already far past anything a real hub sends; the cap is
 # there so a request that hangs against a chatty console cannot grow the buffer
-# without bound. Every well-formed update takes a slot, whether or not it moved
-# anything in the cache (see ``_on_ws_frame``), and overflow is not free -- the
+# without bound. Every update that could move the cache takes a slot, whether or
+# not it turns out to (see ``_on_ws_frame``), and overflow is not free -- the
 # dropped frame is an edge nobody re-reports, so an eviction forces one snapshot
 # once the request it raced has landed.
 MAX_PENDING_DELTAS = 64
+
+# The item keys ``AlarmHub.from_json`` reads, minus ``id`` -- a frame is looked
+# up by its id, so merging that back changes nothing. A frame carrying none of
+# these cannot change the hub the cache holds: everything else in the payload is
+# kept verbatim in ``raw`` and never parsed, so it cannot move anything now or
+# become a merge base that moves something later.
+#
+# Being the parser's own list rather than a guess about which keys look
+# important is what makes it safe to skip the buffer on the strength of it -- a
+# delta left unbuffered is reverted, silently, by the reply it raced, and that
+# is not a mistake worth risking on a hunch. It does mean the two files have to
+# stay in step, so ``test_the_buffer_gate_knows_every_field_the_parser_reads``
+# reads the list back out of ``from_json`` and fails if a field is added there
+# and not here.
+HUB_STATE_KEYS = frozenset({"name", "mac", "state", "isAlarmHub", "alarmHub"})
 
 # Minimum gap between the snapshots the fallback paths spend (seconds). They all
 # guard standing conditions -- an id the REST filter never returns, hub state in
 # a shape we do not parse -- rather than events: asking once every few minutes
 # diagnoses them as well as asking once per frame, and costs nothing in between.
 FALLBACK_RESYNC_INTERVAL = 300.0
+
+# How long after a notification read finishes before the next one may start
+# (seconds).
+#
+# Notifications are not a standing condition and must not share the throttle
+# above: each one is a discrete event, and its read is only true while the thing
+# that caused it is still happening. The captured door pairs were about two
+# seconds apart and the pulses behind #3 ran three to five, so the whole budget
+# is a fraction of a second plus one LAN round trip -- ``REQUEST_TIMEOUT`` calls
+# a healthy one well under a second. Ten seconds, which is what
+# ``async_request_refresh`` costs, is not a slower version of this: it is long
+# enough that the snapshot finds the door shut again, which is the bug.
+#
+# Measured from the *end* of the read, not from the frame that asked for it.
+# That is the whole difference between a bound and a wish. Armed at arrival --
+# which is what ``Debouncer(immediate=True)`` does, and what this used to be --
+# the cooldown expires underneath any read longer than itself, and the console
+# then sets the pace: against a sustained frame stream reads started 0.515s
+# apart whatever they cost, which measured 2.00 GET/s at an 82% REST duty cycle
+# with a 0.45s read -- and 0.303s apart, 3.31 GET/s at 94%, once the stream was
+# fast enough to overrun the delta buffer as well and buy an eviction resync per
+# read. A security integration holding the console's REST endpoint busy more or
+# less permanently, with the coordinator's refresh lock saturated behind it.
+# Armed at completion, a read and a cooldown strictly alternate, so the
+# period is one read plus this and the ceiling is
+# ``1 / (read + NOTIFY_READ_COOLDOWN)`` however fast the console talks. Measured
+# on the same stream, consecutive reads now start 0.501s apart against an
+# instant read (2.00 GET/s), 0.803s apart against a 0.3s read (1.25 GET/s) and
+# 0.952s apart against a 0.45s read (1.05 GET/s) -- and the buffer-overrunning
+# stream measures the same 1.25 GET/s as the ordinary one, because a
+# notification no longer takes a delta slot. 2.00 GET/s is this path's ceiling,
+# reached only by a console that answers instantly -- not the integration's whole
+# REST rate. A stream of *state-carrying* frames fast enough to overrun
+# ``MAX_PENDING_DELTAS`` inside one read window still buys an eviction resync per
+# read, measured at 2.5 GET/s. No frame the captured hardware sends can do that,
+# because every one of them is a notification and takes no slot.
+#
+# A frame arriving on a quiet hub is still read at once -- the request is on the
+# wire before ``_on_ws_frame`` returns -- and a burst still costs two reads: the
+# immediate one and one trailing read covering the rest of the burst.
+NOTIFY_READ_COOLDOWN = 0.5
 
 
 def next_backoff(prev: float) -> float:
@@ -97,6 +175,19 @@ def ws_is_healthy(connected_at: float | None, now: float) -> bool:
 def ws_warning_is_rearmed(connected_at: float | None, now: float) -> bool:
     """Whether that connection lasted long enough for its end to be a new outage."""
     return _uptime_at_least(connected_at, now, WS_WARN_REARM_UPTIME)
+
+
+def carries_hub_state(item: dict[str, Any]) -> bool:
+    """Whether a frame could move the cached hub, and so has an edge worth keeping.
+
+    True of anything naming a field the parser reads (see ``HUB_STATE_KEYS``),
+    whether or not that field turns out to differ -- that question belongs to
+    the snapshot coming back, not to what we hold now. False of the frame the
+    measured console actually sends, which is an id, a modelKey and a
+    ``lastEvent`` timestamp: there is no state in it to lose to an eviction, so
+    it must not spend a buffer slot that a real delta may need.
+    """
+    return not HUB_STATE_KEYS.isdisjoint(item)
 
 
 def fallback_resync_is_due(last_resync: float | None, now: float) -> bool:
@@ -195,12 +286,37 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
         self._eviction_resync_pending = False
         self._rest_in_flight = False
         self._last_fallback_resync: float | None = None
+        # The notification path, in three fields (see ``_pump_notify_read``):
+        # whether a frame is still owed a read that postdates it, whether the
+        # read it is owed has already been queued, and the cooldown, whose
+        # timer being alive is the whole of "too soon".
+        #
+        # Deliberately not a ``Debouncer``. Two of its properties are wrong
+        # here, and neither is configurable. ``immediate=True`` arms the
+        # cooldown when the frame arrives, so a read longer than the cooldown
+        # outlives it: the timer fires, ``_handle_timer_finish`` finds the
+        # execute lock held, clears the pending flag and returns, and nothing
+        # re-arms -- the frame is gone, silently, and the longer the read the
+        # wider that window. And ``_schedule_timer`` never cancels the handle it
+        # replaces, so a frame arriving during a read and that read's own
+        # ``finally`` each arm one; three live cooldown timers were measured on
+        # a sustained stream, driving reads 0.5s apart whatever the read cost.
+        self._notify_pending = False
+        self._notify_read_queued = False
+        self._notify_timer: asyncio.TimerHandle | None = None
 
     async def _async_update_data(self) -> dict[str, AlarmHub]:
         self._pending_deltas.clear()
         self._deltas_evicted = False
         is_eviction_resync = self._eviction_resync_pending
         self._eviction_resync_pending = False
+        # The request goes out below, so its reply postdates every notification
+        # received up to this line and is the answer to all of them. Cleared
+        # here rather than where the read was asked for, so that a scheduled
+        # poll, a reconnect resync or an add/remove snapshot settles a pending
+        # notification too: they are the same full snapshot, and a second read
+        # queued behind one of them would buy nothing.
+        self._notify_pending = False
         self._rest_in_flight = True
         try:
             hubs = await self.client.async_get_alarm_hubs()
@@ -232,6 +348,14 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
                 self._eviction_resync_pending = True
                 self.hass.async_create_task(self.async_refresh())
             self._deltas_evicted = False
+            # A notification that arrived while this request was in flight is
+            # newer than the reply, so the reply is not its answer and a read of
+            # its own is still owed. This is the one place that runs on every
+            # ending -- reply, failure, refused key, cancellation -- which is
+            # exactly why the follow-up is issued from here rather than left to
+            # a cooldown timer armed when the frame arrived: that timer fires
+            # while this request still holds the lock, and nothing re-arms it.
+            self._pump_notify_read()
         return replay_deltas(hubs_by_id(hubs), pending)
 
     @callback
@@ -321,22 +445,38 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
         # console that completes the upgrade and drops the socket straight away
         # reconnects on every backoff tick, and an unbounded resync here would
         # buy a snapshot per flap — the amplification the frame paths are already
-        # throttled against. Nothing cancels the debouncer any more (``_publish``
-        # replaced ``async_set_updated_data``, which used to), so a deferred call
-        # is no longer droppable and the resync always lands.
+        # throttled against.
+        #
+        # A deferred resync can still be cancelled: ``_async_refresh`` calls
+        # ``self._debounced_refresh.async_cancel()`` at the top of every run,
+        # notification reads included. It lands anyway, and not because nothing
+        # cancels it — the thing that cancelled it is a full snapshot taken
+        # after the reconnect, which is all the resync was ever for. What must
+        # not happen is the deferred call being dropped by something that reads
+        # nothing, and that is what ``_publish`` fixed: the delta path used to
+        # call ``async_set_updated_data``, which cancels the debouncer without
+        # going near the console.
         self.hass.async_create_task(self.async_request_refresh())
 
     @callback
     def _on_ws_frame(self, frame: dict[str, Any]) -> None:
-        """Apply an alarm-hub frame to the cached state, or resync if we cannot.
+        """Apply an alarm-hub frame to the cached state, or go and read it.
 
-        An ``update`` for a hub we already hold carries just the fields that
-        changed, so merging it in and publishing synchronously reproduces every
-        edge the hub reported: a zone that opens and closes within a couple of
-        seconds still lands as two state changes at the right times. Re-polling
-        instead would lose them — the request-refresh debouncer holds a
-        ten-second cooldown, and the snapshot it eventually fetched would show
-        the zone closed again, as if nothing had happened.
+        An ``update`` for a hub we already hold *may* carry the fields that
+        changed. Where it does, merging it in and publishing synchronously
+        reproduces every edge the hub reported: a zone that opens and closes
+        within a couple of seconds lands as two state changes at the right
+        times, for no requests at all. Re-polling instead would lose them — the
+        request-refresh debouncer holds a ten-second cooldown, and the snapshot
+        it eventually fetched would show the zone closed again, as if nothing
+        had happened.
+
+        Where it does not — no ``alarmHub``, no ``state``, nothing but an id
+        and a timestamp, which is every frame the measured UP-AlarmHub-Kit
+        firmware sends — the frame is a notification and there is no delta to
+        apply. Dropping it, which is what this used to do, put the console's
+        only real signal on the five-minute poll. It buys a prompt REST read
+        instead: see ``_request_snapshot_promptly``.
 
         Anything else needs a full snapshot, and the two kinds ask for one
         differently. A hub added or removed is a rare, discrete event that a
@@ -372,7 +512,7 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
             # a dict key (a list, say) would otherwise raise in the WS reader.
             self._request_snapshot_throttled()
             return
-        if self._rest_in_flight:
+        if self._rest_in_flight and carries_hub_state(item):
             # Newer than the snapshot already on its way, so keep it to replay
             # over the reply; without that the reply reverts it silently.
             #
@@ -385,6 +525,13 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
             # place the question can be answered. Traffic that turns out not to
             # matter does spend slots, but overflow is no longer silent -- an
             # eviction forces a resync.
+            #
+            # A notification is the one frame that provably cannot: there is no
+            # field in it the parser reads, so the replay has nothing to apply
+            # and an eviction loses nothing (see ``carries_hub_state``). It used
+            # to take a slot anyway, and a console sending more than
+            # MAX_PENDING_DELTAS of them inside one read window then bought an
+            # extra, un-cooled-down GET for an edge that was never there.
             self._buffer_delta(hub_id, item)
         hubs = self.data
         if not hubs or hub_id not in hubs:
@@ -404,14 +551,39 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
                 del hubs[hub_id]
             self._publish(hubs)
             return
-        # Nothing we model moved. That is usually a housekeeping frame (uptime
-        # and friends) or the hub re-reporting a status it already holds, both
-        # routine traffic that has to cost nothing. It can also mean the console
-        # sends hub state in a shape we do not parse, so keep a safety net — on
-        # the same throttle, since that condition stands until someone changes
-        # the code and re-asking at frame rate diagnoses it no better.
         if "alarmHub" not in item and "state" not in item:
+            # The frame said nothing about hub state at all, so there was never
+            # a delta here to lose. This used to return, on the reasoning that a
+            # frame touching no state we model cannot be reporting a change to
+            # it — true of a housekeeping frame, and false of the only frame a
+            # real console sends. A UP-AlarmHub-Kit reports a door opening as
+            # ``{"item": {"lastEvent": <ms>, "id": ..., "modelKey":
+            # "linkstation"}, "type": "update"}`` and nothing else, in pairs a
+            # couple of seconds apart as the door opens and shuts, so returning
+            # here dropped every event the hardware has and left the five-minute
+            # poll to notice — worse than the v0.2 behaviour it replaced.
+            #
+            # We cannot tell that apart from genuine housekeeping, and must not
+            # try: guessing wrong costs an alarm panel a missed zone, while
+            # guessing the other way costs a bounded GET. So ask, and ask fast.
+            #
+            # A wider test than ``carries_hub_state`` uses above, on purpose,
+            # because it is a different question. That one asks whether the
+            # parser reads any of these fields, and can answer for certain. This
+            # one asks whether the console is telling us something happened, and
+            # cannot: a frame carrying an ``uptime`` and nothing else is beyond
+            # the reach of both, and gets no buffer slot (it provably moves
+            # nothing) and a read anyway (it might mean everything).
+            self._request_snapshot_promptly()
             return
+        # The frame did carry hub state, and merging it moved nothing — so the
+        # console has just told us the state and it matches. Nothing happened
+        # that we cannot already see, which is why this one does *not* take the
+        # notification path: it is the hub re-reporting a status it holds,
+        # routine traffic that has to cost nothing. It can also mean the console
+        # sends that state in a shape we do not parse, so keep a safety net — on
+        # the fallback throttle, since that condition stands until someone
+        # changes the code and re-asking at frame rate diagnoses it no better.
         if self._request_snapshot_throttled():
             _LOGGER.debug("Alarm-hub frame matched nothing we parse: %s", item)
 
@@ -429,6 +601,125 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
     def _request_snapshot(self) -> None:
         """Ask for a full REST snapshot, debounced, for a frame we cannot apply."""
         self.hass.async_create_task(self.async_request_refresh())
+
+    @callback
+    def _request_snapshot_promptly(self) -> None:
+        """Read the hub now, because a frame said something happened on it.
+
+        Latency is the whole value of this path. A console that sends no state
+        leaves the REST read as the only way to learn what changed, and the
+        answer stops being true the moment the zone settles: a read that starts
+        within the cooldown and finishes in a LAN round trip catches a two- or
+        three-second door pulse, and one deferred to ``async_request_refresh``'s
+        ten seconds does not — that is #3, and it is why this does not simply
+        reuse it.
+
+        Recording the frame and pumping is all this does: whether a read can
+        start now, has to wait for the one already running, or has to wait for a
+        cooldown is ``_pump_notify_read``'s question, asked again from every
+        place an answer can change.
+        """
+        self._notify_pending = True
+        self._pump_notify_read()
+
+    @callback
+    def _pump_notify_read(self) -> None:
+        """Start the read a notification is owed, or leave it to whoever can.
+
+        Called from the four places the answer can change: a frame arriving, a
+        REST request ending, a notification read ending, and the cooldown after
+        one lapsing. Each of the guards below names something that will pump
+        again when it clears, so a frame recorded here is never left waiting on
+        nobody -- which is the hole this replaced. Together they also make the
+        rate a fact rather than a hope: a read is queued only with no read
+        running, none queued and no cooldown live, and every read this path
+        starts arms a cooldown as it ends, so reads and cooldowns on this path
+        strictly alternate and the ceiling is one per
+        read-plus-``NOTIFY_READ_COOLDOWN``.
+
+        A read this path did *not* start -- the scheduled poll, a reconnect
+        resync -- arms nothing, so a notification that raced one is answered the
+        moment it lands rather than a cooldown later. That is the right way
+        round (the frame is already as old as that request) and it cannot become
+        a rate: those requests have bounds of their own, five minutes and ten
+        seconds respectively.
+
+        Coalescing falls out of ``_notify_pending`` being one flag: two hundred
+        frames inside a read window are two hundred writes of ``True`` and one
+        follow-up read, which is the same snapshot every one of them wanted.
+        """
+        if self._shutdown_requested or not self._notify_pending:
+            return
+        if self._notify_read_queued:
+            # A read is on its way to the lock; its own ``finally`` pumps.
+            return
+        if self._rest_in_flight:
+            # A request is on the wire. Its reply predates this frame, so it is
+            # not the answer -- but ``_async_update_data``'s ``finally`` pumps
+            # on every ending it has, whatever the request does and however long
+            # it takes. That is the fix for the read-longer-than-the-cooldown
+            # window, and it needs no timer at all.
+            return
+        if self._notify_timer is not None:
+            # Cooling down after the last read; the timer pumps when it lapses.
+            return
+        self._notify_read_queued = True
+        # Eagerly started, so on a quiet hub the request is on the wire before
+        # ``_on_ws_frame`` returns -- there is no timer between the frame and
+        # the GET, which is the latency this whole path exists for.
+        self.hass.async_create_task(self._notify_read())
+
+    async def _notify_read(self) -> None:
+        """One REST read for the notification path, then its cooldown.
+
+        ``async_refresh`` rather than ``async_request_refresh``: the shared
+        request-refresh debouncer holds a ten-second cooldown, longer than the
+        events this path exists to catch. The ``finally`` runs on every ending,
+        so a read that failed or was cancelled still arms the cooldown and still
+        hands on to whatever arrived while it ran.
+
+        A failing read is otherwise treated exactly like a successful one: the
+        cooldown is the only spacing, so a console that keeps talking while REST
+        is down is re-read at the full rate rather than backing off. Bounded, and
+        it recovers the moment REST does -- but worth knowing, because a revoked
+        key that somehow leaves the socket up is read at 2 GET/s until the key is
+        replaced. HA dedupes the reauth flow, so it is traffic, not a loop.
+        """
+        try:
+            await self.async_refresh()
+        finally:
+            self._notify_read_queued = False
+            self._start_notify_cooldown()
+            self._pump_notify_read()
+
+    @callback
+    def _start_notify_cooldown(self) -> None:
+        """Bar the next notification read for ``NOTIFY_READ_COOLDOWN`` seconds.
+
+        There is never one of these alive already, and that is a property of the
+        pump rather than of this: a read is queued only when the timer is None,
+        and only a queued read gets here. Which is exactly what
+        ``Debouncer._schedule_timer`` lacked -- it arms without cancelling, and
+        it is reached both by a frame arriving during a read and by that read's
+        own ``finally``, so cooldowns accumulated (three were measured at once)
+        and reads went through at the rate of whichever expired first.
+
+        Not armed at all once shutdown has been requested. This runs from a
+        ``finally``, so it is reached by a read that was still out when the
+        entry unloaded -- and a timer armed there is the orphan that outlives
+        the config entry holding a coordinator whose session is closing.
+        """
+        if self._shutdown_requested:
+            return
+        self._notify_timer = self.hass.loop.call_later(
+            NOTIFY_READ_COOLDOWN, self._end_notify_cooldown
+        )
+
+    @callback
+    def _end_notify_cooldown(self) -> None:
+        """The cooldown lapsed: read again if a frame is still owed one."""
+        self._notify_timer = None
+        self._pump_notify_read()
 
     @callback
     def _request_snapshot_throttled(self) -> bool:
@@ -478,9 +769,18 @@ class AlarmHubCoordinator(DataUpdateCoordinator[dict[str, AlarmHub]]):
 
     async def async_shutdown(self) -> None:
         """Cancel the WS task and shut the coordinator down cleanly."""
+        # First, and before the socket goes. The base class sets
+        # ``_shutdown_requested``, which is what ``_pump_notify_read`` refuses
+        # on, so a frame arriving while the WS task is still being cancelled
+        # below cannot arm a cooldown timer with nothing left to cancel it or
+        # schedule a read against a client whose session is on its way out.
+        await super().async_shutdown()
+        if self._notify_timer is not None:
+            self._notify_timer.cancel()
+            self._notify_timer = None
+        self._notify_pending = False
         if self._ws_task is not None:
             self._ws_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._ws_task
             self._ws_task = None
-        await super().async_shutdown()

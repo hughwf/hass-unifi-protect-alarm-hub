@@ -60,10 +60,13 @@ _GRACEFUL_CLOSE_CODES = frozenset(
 def alarm_hub_frame(raw: str) -> dict[str, Any] | None:
     """Return a parsed devices-WS text frame iff it is for an alarm hub.
 
-    Frames look like ``{"type": ..., "item": {"modelKey": ..., ...}}``, where
-    ``item`` carries only the fields that changed. Returns None for any other
-    model or for malformed JSON, so the caller can ignore the rest of the
-    (chatty, all-device) stream.
+    Frames look like ``{"type": ..., "item": {"modelKey": ..., ...}}``. What
+    else ``item`` carries is up to the firmware and this function does not
+    care: on the UP-AlarmHub-Kit console that has been captured it is a
+    ``lastEvent`` timestamp beside the id and no device state at all, which the
+    coordinator reads as a notification rather than a delta. Returns None for
+    any other model or for malformed JSON, so the caller can ignore the rest of
+    the (chatty, all-device) stream.
     """
     try:
         data = json.loads(raw)
@@ -267,12 +270,15 @@ class AlarmHubApiClient:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 frame = alarm_hub_frame(msg.data)
                 if frame is not None:
-                    # Logged before anything interprets it: the whole delta path
-                    # rests on the console sending the same field shape as the
-                    # REST snapshot, and this is the only place that assumption
-                    # can be checked against real hardware. The README asks for
-                    # debug logs on an issue; this is what makes them worth
-                    # asking for.
+                    # Logged before anything interprets it, and this is the line
+                    # that settled what a frame contains. The delta path was
+                    # written assuming the console puts the changed fields on
+                    # the frame in the same shape the REST snapshot uses; a
+                    # capture from a real UP-AlarmHub-Kit showed it puts no
+                    # state on them at all. Firmware can move that again in
+                    # either direction and this stays the only place anyone can
+                    # tell. The README asks for debug logs on an issue; this is
+                    # what makes them worth asking for.
                     _LOGGER.debug("Alarm-hub frame: %s", msg.data)
                     _isolate("frame", lambda: on_alarm_hub_frame(frame))
             elif msg.type == aiohttp.WSMsgType.ERROR:

@@ -63,17 +63,45 @@ Entities go **unavailable** when their hub is not connected, rather than
 continuing to publish the last thing it said.
 
 ## How updates work
-Updates are **real-time**. The integration subscribes to the Protect devices
-WebSocket (`/subscribe/devices`); each frame carries the fields that changed
-(zone opened, output triggered, tamper, armed state, etc.) and is applied
-straight to the hub's state, so entities change at the moment the hub reports
-it.
+Updates follow the hub rather than a poll clock. The integration subscribes to
+the Protect devices WebSocket (`/subscribe/devices`) and acts on every alarm-hub
+message it sends.
 
-Applying the frame — rather than treating it as a hint to re-read the whole hub
-over REST — is what makes brief events survive. A door that opens and closes in
-three seconds produces two state changes at the right times, which a re-read
-would miss: by the time it ran, the zone would read closed again, as if nothing
-had happened.
+**What those messages contain depends on the console.** The UP-AlarmHub-Kit
+firmware this has been captured against sends a *notification*: the hub's id and
+a timestamp, and nothing at all about zones, outputs or armed state. There is no
+update in it to apply, so the integration reads that hub back over REST
+immediately — the request goes out in the same instant the message arrives, and
+a burst of messages is coalesced into a couple of requests rather than one each.
+Where a console does put the changed fields on the message, they are applied
+directly and no request is made at all.
+
+**The limit, honestly.** Because the read reports what the hub says *now* rather
+than what it said when the message was sent, a zone that opens and closes before
+the read reaches the console is missed. How long that is depends on what else
+the hub is doing.
+
+On a quiet hub it is one LAN round trip: the request goes out in the same
+instant the message arrives, so only a contact that pulses for a fraction of a
+second slips through, and no amount of polling would have caught that either.
+
+When messages are arriving back to back it is longer, because REST traffic is
+capped. A message that lands while a read is already out waits for that read to
+finish and then half a second more before its own read goes out — so against a
+0.3-second read, a 0.82-second pulse survives and a 0.79-second one does not.
+That is the price of the cap, and the cap is the point: without it a chatty
+console can drive this integration's REST traffic as fast as it cares to talk,
+which measured at over three requests a second with the console's API busy 94%
+of the time. As it stands the notification path cannot exceed one read per
+read-plus-half-second — 1.25 requests a second against a 0.3-second read, and 2
+a second in the limit — however many messages arrive. (A console that sent
+changed fields fast enough to overflow the replay buffer could reach about
+2.5; the hardware this was measured against sends none.) (The 5-minute poll and the
+reconnect resync are on top of that, and have bounds of their own.)
+
+What is fixed is the case in [#3](https://github.com/hughwf/hass-unifi-protect-alarm-hub/issues/3):
+a three-second door pulse used to wait on a ten-second cooldown and be read back
+after the door had already shut, so Home Assistant recorded nothing at all.
 
 REST polling runs every **5 minutes** as a reconciling fallback (and for the
 initial load), and a reconnect resyncs in full, so nothing that happened while
@@ -106,8 +134,10 @@ attribute (`normal` / `alarm`) if you want to confirm what is arriving.
 
 **A state change never reached Home Assistant.** Check the log for a WebSocket
 warning: while the socket is down, state only refreshes every 5 minutes, so a
-short zone pulse can pass unseen. It should reconnect on its own — please file
-an issue with debug logs if it does not.
+zone pulse can easily pass unseen. It should reconnect on its own — please file
+an issue with debug logs if it does not. With the socket up, the same thing can
+still happen to a short enough pulse — under a second on a busy hub; see *The
+limit, honestly* above for the numbers.
 
 **Leftover devices or entities.** Nothing here ever deletes a device row or an
 entity: a hub or zone that goes away goes *unavailable* instead, because an

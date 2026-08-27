@@ -5,11 +5,15 @@ layer consumes (``alarm_hub_inputs`` etc.) so platforms stay thin. All status /
 type values are kept as their raw wire strings.
 
 Each hub keeps the JSON it was parsed from, so a partial WebSocket frame can be
-layered over it (``AlarmHub.with_delta``) without a REST round trip. That makes
-parsing part of the cache: a merged payload becomes the base for every later
-merge, so whatever this module keeps, it keeps for good. Hence the rule running
-through it -- parse anything without raising, but refuse to *store* a payload
-that has stopped describing a hub.
+layered over it (``AlarmHub.with_delta``) without a REST round trip. The one
+console anyone has captured never sends such a frame -- its alarm-hub messages
+carry a timestamp and nothing else, and the coordinator reads the hub back over
+REST instead -- but every field name below was checked against that console's
+REST snapshot and matches, so a firmware that does send state merges correctly.
+That makes parsing part of the cache: a merged payload becomes the base for
+every later merge, so whatever this module keeps, it keeps for good. Hence the
+rule running through it -- parse anything without raising, but refuse to *store*
+a payload that has stopped describing a hub.
 """
 
 from __future__ import annotations
