@@ -250,6 +250,17 @@ async def test_learned_profiles_survive_a_restart(hass, hass_storage, freezer):
     assert _state(hass) == "armed_night"  # not back to the Away default
 
 
+async def test_a_profile_learned_just_before_a_reload_is_not_lost(hass):
+    """Saving the options reloads the entry; the delayed save must not lose to it."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_night"
+
+    await restart(hass, entry, console)  # no SAVE_DELAY has passed
+    assert _state(hass) == "armed_night"
+
+
 async def test_only_night_configured_defaults_an_unknown_profile_to_night(hass):
     """Calling it Away would name a mode this panel cannot even command."""
     console = _console(armed="on")

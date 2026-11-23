@@ -67,3 +67,12 @@ class ProfileBook:
             return
         profiles[fingerprint] = profile
         self._store.async_delay_save(lambda: self._data, SAVE_DELAY)
+
+    async def async_flush(self) -> None:
+        """Write now, for an entry that is unloading.
+
+        A reload builds a new book from disk, and saving the options is a
+        reload: without this a profile learned inside ``SAVE_DELAY`` of one is
+        missing from the new book, and reads as the default until armed again.
+        """
+        await self._store.async_save(self._data)

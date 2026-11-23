@@ -79,6 +79,7 @@ async def async_setup_entry(
     devices = async_hub_device_ids(hass, entry)
     book = ProfileBook(hass, entry.entry_id)
     await book.async_load()
+    entry.async_on_unload(book.async_flush)
 
     @callback
     def _build(hub_id: str, hub: AlarmHub) -> list[AlarmHubAlarmPanel]:
