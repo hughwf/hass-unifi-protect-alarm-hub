@@ -803,48 +803,20 @@ def test_hub_device_name_stays_distinct_when_the_console_gave_none(name):
 # --- arm profile ---
 
 
-def _hub_with_live_zones(*live: int, armed="on", total=12) -> AlarmHub:
-    inputs = {
-        zone_id: _zone(zone_id=zone_id, triggers_on_current_profile=zone_id in live)
-        for zone_id in range(1, total + 1)
-    }
-    return _hub(alarm_hub_armed=armed, alarm_hub_inputs=inputs)
-
-
-def test_fingerprint_lists_live_zones_in_numeric_order():
-    """Sorted as numbers: as strings ``10`` sorts before ``2``, and one profile
-    would have two fingerprints depending on how many zones the hub has."""
-    assert logic.profile_fingerprint(_hub_with_live_zones(10, 2, 1)) == "1,2,10"
-
-
-def test_fingerprint_is_none_when_no_zone_is_live():
-    """Nothing to tell profiles apart by, and "" would be one every such
-    profile shares."""
-    assert logic.profile_fingerprint(_hub_with_live_zones()) is None
-
-
-def test_zone_without_the_profile_field_is_not_live():
-    hub = _hub(alarm_hub_inputs={1: _zone(triggers_on_current_profile=None)})
-    assert logic.profile_fingerprint(hub) is None
-
-
 def test_arm_profile_disarmed_and_unknown():
-    assert logic.arm_profile(_hub_with_live_zones(1, armed="off"), {}) == "disarmed"
+    assert logic.arm_profile(_hub(alarm_hub_armed="off"), None) == "disarmed"
+    # A profile credited earlier does not outlive the hub saying it is disarmed.
+    assert (
+        logic.arm_profile(_hub(alarm_hub_armed="off"), logic.PROFILE_NIGHT)
+        == "disarmed"
+    )
     # Unknown, not disarmed: a missing field must not read as "the house is safe".
-    assert logic.arm_profile(_hub_with_live_zones(1, armed=None), {}) is None
-    assert logic.arm_profile(_hub_with_live_zones(1, armed="bogus"), {}) is None
+    assert logic.arm_profile(_hub(alarm_hub_armed=None), None) is None
+    assert logic.arm_profile(_hub(alarm_hub_armed="bogus"), None) is None
 
 
-def test_arm_profile_uses_what_was_learned_else_the_default():
-    hub = _hub_with_live_zones(3, 4)
-    assert logic.arm_profile(hub, {"3,4": logic.PROFILE_NIGHT}) == "armed_night"
-    assert logic.arm_profile(hub, {"9": logic.PROFILE_NIGHT}) == "armed_away"
-    assert (
-        logic.arm_profile(hub, {}, default=logic.PROFILE_NIGHT) == logic.PROFILE_NIGHT
-    )
-
-
-def test_arm_profile_armed_with_no_live_zones_is_the_default():
-    assert (
-        logic.arm_profile(_hub_with_live_zones(), {"": "armed_night"}) == "armed_away"
-    )
+def test_arm_profile_is_what_was_armed_from_here_else_the_default():
+    hub = _hub(alarm_hub_armed="on")
+    assert logic.arm_profile(hub, logic.PROFILE_NIGHT) == "armed_night"
+    assert logic.arm_profile(hub, None) == "armed_away"
+    assert logic.arm_profile(hub, None, default=logic.PROFILE_NIGHT) == "armed_night"

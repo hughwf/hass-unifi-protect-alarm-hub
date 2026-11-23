@@ -3,8 +3,9 @@
 The Alarm Hub is stuck in Global Alarm Manager mode, where the API cannot set the
 arm profile, so the panel fires user-configured webhooks and reads the result
 back from the hub. The console here is the fake from ``platform_common`` with
-each webhook given an *effect* -- what the real console would do to the hub --
-so a test states "arming Night lights zone 4" instead of poking state by hand.
+each webhook given an *effect* -- what the real console would do to the hub.
+Arming Away and arming Night have the same effect on purpose: on real hardware
+the hub reports ``armed`` and nothing that tells the two apart.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from homeassistant.components.alarm_control_panel import (
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
 
-from custom_components.unifi_protect_alarm_hub.alarm_control_panel import LEARN_WINDOW
+from custom_components.unifi_protect_alarm_hub.alarm_control_panel import ARM_WINDOW
 from custom_components.unifi_protect_alarm_hub.api import (
     AlarmHubAuthError,
     AlarmHubConnectionError,
@@ -27,9 +28,7 @@ from custom_components.unifi_protect_alarm_hub.const import (
     CONF_ARM_AWAY_TRIGGER,
     CONF_ARM_NIGHT_TRIGGER,
     CONF_DISARM_TRIGGER,
-    DOMAIN,
 )
-from custom_components.unifi_protect_alarm_hub.profiles import SAVE_DELAY
 from platform_common import (  # noqa: F401  (unload_entries is an autouse fixture)
     FakeConsole,
     advance,
@@ -49,22 +48,9 @@ ALL_TRIGGERS = {
     CONF_DISARM_TRIGGER: "disarm-id",
 }
 
-# What the two profiles light up on the standard two-zone hub: Away watches the
-# hallway motion sensor and the garage door, Night only the door.
-AWAY_ZONES = {"4", "6"}
-NIGHT_ZONES = {"6"}
 
-
-def _arm(zones: set[str]):
-    """The console's effect for a webhook that arms a profile lighting ``zones``."""
-
-    def effect(payload: dict[str, Any]) -> None:
-        hub = payload["alarmHub"]
-        hub["armed"] = "on"
-        for zone_id, zone in hub["input"].items():
-            zone["triggerOnCurrentArmingProfile"] = "on" if zone_id in zones else "off"
-
-    return effect
+def _arm(payload: dict[str, Any]) -> None:
+    payload["alarmHub"]["armed"] = "on"
 
 
 def _disarm(payload: dict[str, Any]) -> None:
@@ -76,8 +62,8 @@ def _console(*, armed: str = "off") -> FakeConsole:
     payload["alarmHub"]["armed"] = armed
     console = FakeConsole(payload)
     console.webhook_effects = {
-        "away-id": _arm(AWAY_ZONES),
-        "night-id": _arm(NIGHT_ZONES),
+        "away-id": _arm,
+        "night-id": _arm,
         "disarm-id": _disarm,
     }
     return console
@@ -126,7 +112,7 @@ async def test_disarmed_and_armed_states_come_from_the_hub(hass):
 
     console.payloads[0]["alarmHub"]["armed"] = "on"
     await poll(hass, entry)
-    assert _state(hass) == "armed_away"  # profile never seen: the default
+    assert _state(hass) == "armed_away"  # not armed from here: the default
 
 
 async def test_an_armed_field_the_hub_did_not_send_reads_unknown(hass):
@@ -163,25 +149,34 @@ async def test_disarming_fires_its_webhook(hass, freezer):
     assert _state(hass) == "disarmed"
 
 
-async def test_a_profile_armed_from_here_is_recognised_afterwards(hass, freezer):
-    """The point of the fingerprint: once Night has been armed from Home
-    Assistant, Night armed from a fob later still reads as Night."""
+async def test_the_profile_armed_from_here_is_shown_until_disarmed(hass, freezer):
     console = _console()
     entry = await setup_integration(hass, console, ALL_TRIGGERS)
 
-    await _call(hass, "alarm_arm_away")
-    await _call_disarm_then(hass, freezer, "alarm_arm_night")
+    await _call(hass, "alarm_arm_night")
     assert _state(hass) == "armed_night"
+    await advance(hass, freezer, ARM_WINDOW + 1)
+    await poll(hass, entry)
+    assert _state(hass) == "armed_night"  # the label outlives the window
 
-    # Someone disarms at the keypad and re-arms Away there, then Night there.
+    _disarm(console.payloads[0])  # at the keypad
+    await poll(hass, entry)
+    assert _state(hass) == "disarmed"
+
+
+async def test_armed_from_elsewhere_reads_as_the_default(hass, freezer):
+    """The hub does not say which profile, so a keypad arm is only "armed"."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+    await _call_disarm_then(hass, freezer, "alarm_arm_night")
+    await advance(hass, freezer, ARM_WINDOW + 1)
+
     _disarm(console.payloads[0])
     await poll(hass, entry)
-    _arm(AWAY_ZONES)(console.payloads[0])
+    _arm(console.payloads[0])  # someone arms at the keypad, long after
     await poll(hass, entry)
     assert _state(hass) == "armed_away"
-    _arm(NIGHT_ZONES)(console.payloads[0])
-    await poll(hass, entry)
-    assert _state(hass) == "armed_night"
 
 
 async def _call_disarm_then(hass, freezer, service: str) -> None:
@@ -192,32 +187,15 @@ async def _call_disarm_then(hass, freezer, service: str) -> None:
     await _call(hass, service)
 
 
-async def test_switching_profile_while_armed_does_not_mislabel_the_old_one(
-    hass, freezer
-):
-    """Arm Night *from Away*: the first read can still be Away's zones, because
-    the hub has been told but has not switched yet. Filing that as Night would
-    mislabel the profile that was working."""
+async def test_switching_profile_from_here_while_armed(hass, freezer):
     console = _console()
-    entry = await setup_integration(hass, console, ALL_TRIGGERS)
-    await _call(hass, "alarm_arm_away")  # learns Away = "4,6"
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_away")
     assert _state(hass) == "armed_away"
 
-    # The hub accepts the Night webhook but is slow to act on it.
-    console.webhook_effects["night-id"] = lambda payload: None
     await advance(hass, freezer, 11)
     await _call(hass, "alarm_arm_night")
-    assert _state(hass) == "armed_away"  # still Away's zones: not learned as Night
-
-    # Now it switches; Night is learned from the real change.
-    _arm(NIGHT_ZONES)(console.payloads[0])
-    await poll(hass, entry)
     assert _state(hass) == "armed_night"
-
-    # And Away is still Away.
-    _arm(AWAY_ZONES)(console.payloads[0])
-    await poll(hass, entry)
-    assert _state(hass) == "armed_away"
 
 
 async def test_an_arm_that_never_took_effect_stops_waiting(hass, freezer):
@@ -229,36 +207,115 @@ async def test_an_arm_that_never_took_effect_stops_waiting(hass, freezer):
     await _call(hass, "alarm_arm_night")
     assert _state(hass) == "disarmed"
 
-    await advance(hass, freezer, LEARN_WINDOW + 1)
-    _arm(AWAY_ZONES)(console.payloads[0])  # someone arms Away at the keypad
+    await advance(hass, freezer, ARM_WINDOW + 1)
+    _arm(console.payloads[0])  # someone arms at the keypad
     await poll(hass, entry)
-    # Had the pending Night still been waiting, "4,6" would now be filed as Night.
+    # Had the Night command still been waiting, this would now read Night.
     assert _state(hass) == "armed_away"
 
 
-async def test_learned_profiles_survive_a_restart(hass, hass_storage, freezer):
+async def test_an_arm_the_hub_reports_late_is_seen_without_a_push(hass, freezer):
+    """Arming sends no WebSocket frame, so the panel has to go back and look:
+    left to the five-minute poll it would read disarmed, then uncredited."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])  # the hub acts a moment later, and pushes nothing
+    await advance(hass, freezer, 2)
+    assert _state(hass) == "armed_night"
+
+
+async def test_a_disarm_the_hub_reports_late_is_seen_without_a_push(hass, freezer):
+    console = _console(armed="on")
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["disarm-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_disarm")
+    assert _state(hass) == "armed_away"
+
+    _disarm(console.payloads[0])
+    await advance(hass, freezer, 2)
+    assert _state(hass) == "disarmed"
+
+
+async def test_follow_up_reads_stop_once_the_hub_has_answered(hass, freezer):
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")  # the fake arms at once
+    polls = console.polls
+    await advance(hass, freezer, 30)
+    assert console.polls == polls
+
+
+async def test_one_command_does_not_label_a_second_spell(hass):
+    """Armed Night from here, then disarmed and re-armed at the keypad while the
+    window is still open: the second arm is not ours."""
     console = _console()
     entry = await setup_integration(hass, console, ALL_TRIGGERS)
     await _call(hass, "alarm_arm_night")
     assert _state(hass) == "armed_night"
 
-    await advance(hass, freezer, SAVE_DELAY + 1)  # let the delayed save land
-    stored = hass_storage[f"{DOMAIN}.{entry.entry_id}.profiles"]["data"]
-    assert list(stored.values()) == [{"6": "armed_night"}]
+    _disarm(console.payloads[0])
+    await poll(hass, entry)
+    _arm(console.payloads[0])
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
+
+
+async def test_a_disarm_withdraws_an_arm_still_waiting(hass, freezer):
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # slow to act
+    await _call(hass, "alarm_arm_night")
+    await advance(hass, freezer, 11)
+    await _call(hass, "alarm_disarm")
+
+    _arm(console.payloads[0])  # armed at the keypad, inside the old window
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
+
+
+async def test_every_hub_credits_the_same_command(hass):
+    """The Alarm Manager arms every hub at once; the panel beside the one that
+    was pressed must not read Away while its neighbour reads Night."""
+    second = hub_json("ah2", mac="112233445566", name="Second Hub")
+    second["alarmHub"]["armed"] = "off"
+    console = _console()
+    console.payloads.append(second)
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    panels = entity_ids(hass, "alarm_control_panel")
+    assert len(panels) == 2
+
+    await _call(hass, "alarm_arm_night")
+    assert {hass.states.get(panel).state for panel in panels} == {"armed_night"}
+
+
+async def test_the_credited_profile_survives_a_restart(hass):
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_night"
 
     await restart(hass, entry, console)
     assert _state(hass) == "armed_night"  # not back to the Away default
 
 
-async def test_a_profile_learned_just_before_a_reload_is_not_lost(hass):
-    """Saving the options reloads the entry; the delayed save must not lose to it."""
+async def test_a_restored_profile_does_not_outlive_a_disarm_it_missed(hass):
+    """Disarmed while Home Assistant was down: the old label must not be waiting
+    for whoever arms next."""
     console = _console()
     entry = await setup_integration(hass, console, ALL_TRIGGERS)
     await _call(hass, "alarm_arm_night")
-    assert _state(hass) == "armed_night"
 
-    await restart(hass, entry, console)  # no SAVE_DELAY has passed
-    assert _state(hass) == "armed_night"
+    _disarm(console.payloads[0])
+    await restart(hass, entry, console)
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
 
 
 async def test_only_night_configured_defaults_an_unknown_profile_to_night(hass):

@@ -7,8 +7,18 @@ such alarm per action in Protect (Arm Away, Arm Night, Disarm) and giving this
 integration each alarm's Trigger ID. State comes back the way every other entity
 here gets it: from the hub, read over REST when the WebSocket says it changed.
 
-Two limits follow from that and are deliberate rather than missing:
+The hub says *whether* it is armed and nothing about *which* profile. Measured
+on a real UP-AlarmHub-Kit pair under the Global Alarm Manager (Protect 7.3.74,
+2026-11-23), arming and disarming from the Protect app moved ``armed`` and
+nothing else: every zone's ``triggerOnCurrentArmingProfile`` stayed ``on``, and
+the console's ``armMode`` (``GET /v1/nvrs``) stayed ``disabled`` throughout. So
+the panel shows the profile Home Assistant itself last armed, and a default when
+the hub was armed from a keypad, a fob or the Protect app.
 
+Limits that follow from what the hub reports, deliberate rather than missing:
+
+* **Armed from elsewhere reads as the default profile.** There is nothing to
+  tell Away from Night by.
 * **No ``arming`` / ``pending`` states.** Protect does not report an exit delay,
   so the panel goes straight from disarmed to the armed state once the hub
   reports it, instead of claiming a transition it cannot see.
@@ -20,7 +30,8 @@ Two limits follow from that and are deliberate rather than missing:
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, NamedTuple
 
 from homeassistant.components.alarm_control_panel import (
     AlarmControlPanelEntity,
@@ -30,10 +41,16 @@ from homeassistant.components.alarm_control_panel import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import AlarmHubConfigEntry, logic
 from .api import AlarmHubAuthError, AlarmHubConnectionError
-from .const import CONF_ARM_AWAY_TRIGGER, CONF_ARM_NIGHT_TRIGGER, CONF_DISARM_TRIGGER
+from .const import (
+    CONF_ARM_AWAY_TRIGGER,
+    CONF_ARM_NIGHT_TRIGGER,
+    CONF_DISARM_TRIGGER,
+    DOMAIN,
+)
 from .coordinator import AlarmHubCoordinator
 from .entity import (
     AlarmHubBaseEntity,
@@ -42,19 +59,48 @@ from .entity import (
 )
 from .logic import PROFILE_AWAY, PROFILE_DISARMED, PROFILE_NIGHT, HubDeviceIds
 from .models import AlarmHub
-from .profiles import ProfileBook
 
-# How long an arm command waits for the hub to report the profile it took before
-# the wait is abandoned. An arm that never took effect (a webhook pointed at the
-# wrong alarm, a hub refusing because a zone is open) must not leave the panel
-# waiting to label whatever profile someone arms next.
-LEARN_WINDOW = 120.0
+# How long after an arm command the hub may take to report armed and still have
+# that credited to the command. Arms from the Protect app showed up within a few
+# seconds; the rest is margin. Kept short because inside it an arm from anywhere
+# else cannot be told from ours: a webhook that was accepted and did nothing,
+# followed by someone arming at a keypad, shows our profile until the next
+# disarm.
+ARM_WINDOW = 20.0
+
+# Seconds to wait before each follow-up read after a command, for as long as the
+# hub has not reported what was asked for. Arming and disarming send no frame on
+# the devices WebSocket -- six transitions on a real console, none pushed -- so
+# without these the panel sits on the old state until the next SCAN_INTERVAL
+# poll, by which time an arm is outside ARM_WINDOW and goes uncredited. They add
+# up to 15s, inside ARM_WINDOW.
+SETTLE_DELAYS = (1.0, 2.0, 4.0, 8.0)
 
 _STATES = {
     PROFILE_DISARMED: AlarmControlPanelState.DISARMED,
     PROFILE_AWAY: AlarmControlPanelState.ARMED_AWAY,
     PROFILE_NIGHT: AlarmControlPanelState.ARMED_NIGHT,
 }
+_PROFILES = {state.value: profile for profile, state in _STATES.items()}
+
+
+class _Command(NamedTuple):
+    """An arm command this entry sent: its profile, and when crediting it stops."""
+
+    profile: str
+    deadline: float
+
+
+class _LastCommand:
+    """The latest arm command, shared by every panel of one entry.
+
+    Shared because the webhooks belong to the entry, not to a hub: the Alarm
+    Manager arms every hub at once, so the panel that was pressed and the panel
+    of the hub beside it both have to credit the same command.
+    """
+
+    def __init__(self) -> None:
+        self.command: _Command | None = None
 
 
 async def async_setup_entry(
@@ -77,18 +123,16 @@ async def async_setup_entry(
 
     coordinator: AlarmHubCoordinator = entry.runtime_data
     devices = async_hub_device_ids(hass, entry)
-    book = ProfileBook(hass, entry.entry_id)
-    await book.async_load()
-    entry.async_on_unload(book.async_flush)
+    last = _LastCommand()
 
     @callback
     def _build(hub_id: str, hub: AlarmHub) -> list[AlarmHubAlarmPanel]:
-        return [AlarmHubAlarmPanel(coordinator, devices, hub_id, triggers, book)]
+        return [AlarmHubAlarmPanel(coordinator, devices, hub_id, triggers, last)]
 
     async_reconcile_on_update(entry, coordinator, devices, async_add_entities, _build)
 
 
-class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity):
+class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity, RestoreEntity):
     _attr_name = None
     _attr_code_arm_required = False
 
@@ -98,11 +142,11 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity):
         devices: HubDeviceIds,
         hub_id: str,
         triggers: dict[str, str],
-        book: ProfileBook,
+        last: _LastCommand,
     ) -> None:
         super().__init__(coordinator, devices, hub_id)
         self._triggers = triggers
-        self._book = book
+        self._last = last
         self._attr_unique_id = logic.entity_unique_id(self._device_id, "alarm_panel")
         features = AlarmControlPanelEntityFeature(0)
         if triggers[CONF_ARM_AWAY_TRIGGER]:
@@ -110,13 +154,31 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity):
         if triggers[CONF_ARM_NIGHT_TRIGGER]:
             features |= AlarmControlPanelEntityFeature.ARM_NIGHT
         self._attr_supported_features = features
-        # (profile being armed, the fingerprint in force when it was commanded,
-        # deadline). See ``_learn``.
-        self._pending: tuple[str, str | None, float] | None = None
+        # The profile this armed spell is credited to, and the command that was
+        # credited for it -- kept so one command cannot label two spells: ours,
+        # then a keypad re-arm that lands inside the same window.
+        self._armed_as: str | None = None
+        self._credited: _Command | None = None
+        self._settle_task: asyncio.Task[None] | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Pick the credited profile back up across a restart or a reload.
+
+        Without it, restarting Home Assistant while armed Night reads Away until
+        the next arm. It is only as good as the last thing seen: a hub disarmed
+        and re-armed from a keypad while Home Assistant was down keeps the old
+        label until it disarms.
+        """
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        restored = _PROFILES.get(last_state.state) if last_state else None
+        if restored in (PROFILE_AWAY, PROFILE_NIGHT):
+            self._armed_as = restored
+            self._credit()
 
     @property
     def _default_profile(self) -> str:
-        """What an armed hub with an unrecognised profile is called.
+        """What a hub armed from somewhere else is called.
 
         Away unless only Night can be armed from here, in which case calling it
         Away would be naming a mode this panel cannot even command.
@@ -133,42 +195,38 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity):
         hub = self.hub
         if hub is None:
             return None
-        profile = logic.arm_profile(
-            hub, self._book.for_device(self._device_id), self._default_profile
-        )
+        profile = logic.arm_profile(hub, self._armed_as, self._default_profile)
         return _STATES.get(profile) if profile else None
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        self._learn()
+        self._credit()
         super()._handle_coordinator_update()
 
     @callback
-    def _learn(self) -> None:
-        """Label the fingerprint of the profile we just armed, once it shows.
+    def _credit(self) -> None:
+        """Decide which profile the hub's armed state belongs to.
 
-        The fingerprint has to differ from the one in force when the command was
-        sent. Otherwise the first read after arming Night *from Away* can still
-        be Away's zones -- the hub has been told but has not switched -- and
-        Away's fingerprint would be filed as Night, mislabelling the very mode
-        that was working. If Away and Night light identical zones there is
-        nothing to tell them apart by and the label is never learned; the
-        default stands, which is the honest answer.
+        Disarmed ends the spell, so whatever arms it next starts unlabelled.
+        Armed is credited to the latest arm command sent from here if that
+        command is recent and has not already labelled a spell on this hub;
+        otherwise the label stands as it was -- ours from earlier in this spell,
+        or none, which reads as the default.
         """
-        if self._pending is None:
-            return
-        profile, before, deadline = self._pending
-        if self.coordinator.hass.loop.time() > deadline:
-            self._pending = None
-            return
         hub = self.hub
-        if hub is None or logic.armed_is_on(hub.alarm_hub_armed) is not True:
+        armed = logic.armed_is_on(hub.alarm_hub_armed) if hub else None
+        if armed is False:
+            self._armed_as = None
             return
-        fingerprint = logic.profile_fingerprint(hub)
-        if fingerprint is None or fingerprint == before:
-            return
-        self._book.learn(self._device_id, fingerprint, profile)
-        self._pending = None
+        command = self._last.command
+        if (
+            armed
+            and command is not None
+            and command is not self._credited
+            and self.coordinator.hass.loop.time() <= command.deadline
+        ):
+            self._armed_as = command.profile
+            self._credited = command
 
     async def async_alarm_disarm(self, code: str | None = None) -> None:
         await self._async_fire(CONF_DISARM_TRIGGER, "disarm", None)
@@ -194,8 +252,6 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity):
                 f"No webhook Trigger ID is configured to {action}; add one in this"
                 " integration's options (Alarm Manager alarm, Trigger = Webhook)"
             )
-        hub = self.hub
-        before = logic.profile_fingerprint(hub) if hub else None
         try:
             await self.coordinator.client.async_fire_webhook(trigger_id)
         except AlarmHubAuthError as err:
@@ -209,12 +265,30 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity):
                 f" ({err}). Check that the Trigger ID matches an Alarm Manager"
                 " alarm whose Trigger is Webhook"
             ) from err
-        self._pending = (
+        # A disarm withdraws any arm still waiting to be credited.
+        self._last.command = (
             None
             if profile is None
-            else (profile, before, self.coordinator.hass.loop.time() + LEARN_WINDOW)
+            else _Command(profile, self.coordinator.hass.loop.time() + ARM_WINDOW)
         )
         await self.coordinator.async_request_refresh()
+        if self._settle_task is not None:
+            self._settle_task.cancel()
+        # A background task of the entry, so unloading cancels it.
+        self._settle_task = self.coordinator.entry.async_create_background_task(
+            self.hass,
+            self._async_settle(want_armed=profile is not None),
+            name=f"{DOMAIN}_panel_settle",
+        )
+
+    async def _async_settle(self, *, want_armed: bool) -> None:
+        """Re-read the hub until it reports what was asked for (see SETTLE_DELAYS)."""
+        for delay in SETTLE_DELAYS:
+            hub = self.hub
+            if hub and logic.armed_is_on(hub.alarm_hub_armed) is want_armed:
+                return
+            await asyncio.sleep(delay)
+            await self.coordinator.async_refresh()
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

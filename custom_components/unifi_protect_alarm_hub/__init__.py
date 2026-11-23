@@ -12,7 +12,6 @@ from .config_flow import async_migrate_unique_id
 from .const import PLATFORMS
 from .coordinator import AlarmHubCoordinator
 from .entity import async_migrate_hub_identity
-from .profiles import async_remove_profiles
 
 type AlarmHubConfigEntry = ConfigEntry[AlarmHubCoordinator]
 
@@ -52,8 +51,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: AlarmHubConfigEntry) ->
     if unloaded:
         await entry.runtime_data.async_shutdown()
     return unloaded
-
-
-async def async_remove_entry(hass: HomeAssistant, entry: AlarmHubConfigEntry) -> None:
-    """Forget the arm profiles learned for an entry that is being deleted."""
-    await async_remove_profiles(hass, entry.entry_id)

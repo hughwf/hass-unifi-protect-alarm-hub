@@ -59,14 +59,12 @@ An `alarm_control_panel` entity then appears, offering only the actions you
 configured. With every field blank there is no panel — only the read-only
 entities — because a panel that cannot act would just repeat the *Armed* sensor.
 
-**How it knows Away from Night.** The hub reports *whether* it is armed but not
-*which* profile. It does report, per zone, whether the zone is live under the
-current profile, and Away and Night normally light different zones — so the set
-of live zones identifies the profile. The panel learns each set the first time
-you arm that profile **from Home Assistant**, remembers it across restarts, and
-from then on recognises it however it was armed (fob, keypad, the Protect app).
-Until a profile has been seen, an armed hub reads as *armed away* (or *armed
-night* if Night is the only action you configured).
+**Away or Night.** The hub reports *whether* it is armed but not *which*
+profile, so the panel shows the profile **Home Assistant last armed**: press
+*Arm Night* and it reads *armed night* until the hub disarms, across restarts.
+A hub armed from anywhere else (fob, keypad, the Protect app) reads as *armed
+away* (or *armed night* if Night is the only action you configured), whichever
+profile it really is.
 
 Things it deliberately does not do:
 - **No `arming`/`pending` state.** Protect does not report an exit delay, so the
@@ -74,8 +72,15 @@ Things it deliberately does not do:
 - **No `triggered` state.** A beeper chirping through an entry delay looks the
   same as a siren, and a panel that cries "triggered" on every arrival is worse
   than one that stays quiet. Use the output switches for a real siren.
-- **Away and Night that light identical zones cannot be told apart.** The label
-  is never learned and the default stands.
+- **Arming or disarming from elsewhere can take up to 5 minutes to show.** The
+  console pushes zone activity but not arm state, so a change made at a keypad
+  or in the Protect app is picked up by the next poll (or the next zone event).
+  Commands sent from Home Assistant are read back within seconds.
+- **It cannot tell Away from Night when the hub is armed elsewhere.** Measured
+  on real hardware, nothing the hub reports differs between the two.
+- **A webhook that Protect accepts but does not act on can mislabel one arm.** If
+  someone then arms from a keypad within 20 seconds, the panel shows the profile
+  you pressed until the next disarm.
 - **It cannot check a Trigger ID until you use it.** A wrong ID surfaces as an
   error on the first arm/disarm attempt, which says to check it.
 
@@ -165,8 +170,8 @@ match an Alarm Manager alarm whose trigger is *Webhook*, or the alarm was
 deleted. Re-copy the ID from that alarm in Protect. Two actions cannot share an
 ID, and the options form refuses it.
 
-**The panel says *armed away* when it is armed Night.** That profile has not been
-seen yet: arm Night once from Home Assistant and it is remembered.
+**The panel says *armed away* when it is armed Night.** It was armed from
+outside Home Assistant, and the hub does not report which profile is in force.
 
 If no entities appear, confirm the API key has Protect read access. A console
 with no adopted alarm hub is now refused while adding the integration, and a hub

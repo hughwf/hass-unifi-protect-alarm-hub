@@ -6,7 +6,6 @@ import pytest
 
 from custom_components.unifi_protect_alarm_hub.models import (
     AlarmHub,
-    InputZone,
     deep_merge,
     describe_hub_payload,
     keeps_hub_shape,
@@ -549,19 +548,3 @@ def test_the_shape_summary_distinguishes_two_hubs_on_one_console():
 
     assert "mac='AABBCCDDEEFF'" in one
     assert "mac='9041B2E6E2CB'" in two
-
-
-def test_zone_parses_whether_it_triggers_on_the_current_profile():
-    """The per-zone flag the arm-profile fingerprint is built from."""
-    on = InputZone.from_json(1, {"triggerOnCurrentArmingProfile": "on"})
-    off = InputZone.from_json(2, {"triggerOnCurrentArmingProfile": "off"})
-    assert on.triggers_on_current_profile is True
-    assert off.triggers_on_current_profile is False
-
-
-@pytest.mark.parametrize("value", [None, "junk", 1, True])
-def test_zone_profile_flag_is_unknown_when_absent_or_unrecognised(value):
-    """Unknown is not "off": a console that omits the field must not be read as
-    saying the zone is dormant."""
-    data = {} if value is None else {"triggerOnCurrentArmingProfile": value}
-    assert InputZone.from_json(1, data).triggers_on_current_profile is None
