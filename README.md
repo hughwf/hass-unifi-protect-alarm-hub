@@ -10,7 +10,7 @@ integration API** directly over its own small HTTP client, with no `uiprotect`
 dependency. It therefore runs side by side with the official UniFi Protect
 integration without any shared-library version conflict.
 
-> **v0.3 — still being validated against real hardware.** Built against the
+> **v0.4 — still being validated against real hardware.** Built against the
 > documented public alarm-hub API. Please file issues with debug logs.
 
 ## Requirements
@@ -207,7 +207,7 @@ and those have to be deleted by hand.
   the order the console lists them the first time they are seen.
 
 ## Status
-v0.3 — built against the public alarm-hub API and validated against mocked
+v0.4 — built against the public alarm-hub API and validated against mocked
 consoles, including upgrades replayed from the registries earlier releases
 actually wrote. Still wants real-world testing. Please report issues with debug
 logs.
