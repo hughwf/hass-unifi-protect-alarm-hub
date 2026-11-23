@@ -34,7 +34,8 @@
       "invalid_auth": "Invalid authentication",
       "invalid_host": "That address cannot be used. Enter the console's host name or IP address, for example 192.168.1.1.",
       "no_alarm_hub": "Connected to the console, but it has no adopted Alarm Hub, so there would be nothing to control. Adopt the hub in UniFi Protect and submit again.",
-      "unknown": "Unexpected error"
+      "unknown": "Unexpected error",
+      "duplicate_trigger": "Each action needs its own Trigger ID; the same one was entered twice."
     },
     "abort": {
       "already_configured": "This UniFi Protect console is already configured",
@@ -42,6 +43,22 @@
       "reauth_successful": "The new API key was accepted",
       "reconfigure_successful": "The new settings were accepted",
       "unique_id_mismatch": "That key reached a different UniFi Protect console: none of the Alarm Hubs this entry owns are on it. Enter a key for the console this entry was set up with, or add the other console as a new entry."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Arm and disarm from Home Assistant",
+        "description": "The Alarm Hub forces UniFi's Global Alarm Manager, where the API cannot set the arm profile directly. Instead, in UniFi Protect → Alarm Manager create an alarm for each action you want, with Trigger = Webhook and Action = Arm (pick the profile) or Disarm, then paste each alarm's Trigger ID here. Leave all three blank for read-only entities. Saving reloads the integration.",
+        "data": {
+          "arm_away_trigger_id": "Arm Away — webhook Trigger ID",
+          "arm_night_trigger_id": "Arm Night — webhook Trigger ID",
+          "disarm_trigger_id": "Disarm — webhook Trigger ID"
+        }
+      }
+    },
+    "error": {
+      "duplicate_trigger": "Each action needs its own Trigger ID; the same one was entered twice."
     }
   }
 }

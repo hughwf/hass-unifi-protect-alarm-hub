@@ -170,6 +170,58 @@ def armed_is_on(armed: str | None) -> bool | None:
     return armed == "on"
 
 
+# The arm profiles the alarm panel can name. Plain strings so this module stays
+# free of Home Assistant; the platform maps them onto its own states.
+PROFILE_DISARMED = "disarmed"
+PROFILE_AWAY = "armed_away"
+PROFILE_NIGHT = "armed_night"
+
+
+def profile_fingerprint(hub: AlarmHub) -> str | None:
+    """Which zones are live under the arm profile in force, as a stable string.
+
+    The Alarm Hub reports *whether* it is armed but not *which* profile, and the
+    Integration API cannot be asked. What it does report per zone is whether the
+    zone triggers under the current profile, and Away and Night are normally
+    different sets -- so the set identifies the profile once it has been seen
+    labelled. Zone ids sorted numerically so ``"10"`` does not sort before
+    ``"2"``, which would make one profile two fingerprints depending on how many
+    zones the hub has.
+
+    ``None`` when no zone reports being live: nothing to tell profiles apart by,
+    and an empty string would be a fingerprint every such profile shares.
+    """
+    live = sorted(
+        zone_id
+        for zone_id, zone in hub.alarm_hub_inputs.items()
+        if zone.triggers_on_current_profile
+    )
+    return ",".join(str(zone_id) for zone_id in live) or None
+
+
+def arm_profile(
+    hub: AlarmHub, learned: Mapping[str, str], default: str = PROFILE_AWAY
+) -> str | None:
+    """The alarm panel's state for ``hub``: disarmed, or which profile is armed.
+
+    ``None`` when the hub did not say whether it is armed -- unknown, not
+    "disarmed": a panel must not tell someone the house is unarmed on the
+    strength of a field the console left out.
+
+    An armed hub whose profile has not been seen labelled yet is ``default``.
+    That is a guess and is named as one by the caller's docs, but the
+    alternative is no armed state at all for a system that plainly is armed, and
+    the guess corrects itself the first time the profile is armed from here.
+    """
+    armed = armed_is_on(hub.alarm_hub_armed)
+    if armed is None:
+        return None
+    if not armed:
+        return PROFILE_DISARMED
+    fingerprint = profile_fingerprint(hub)
+    return learned.get(fingerprint, default) if fingerprint else default
+
+
 def cover_is_on(cover: Cover | None) -> bool | None:
     """Whether the tamper cover is open. None when we cannot tell.
 

@@ -20,6 +20,7 @@ import json
 import logging
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -227,6 +228,22 @@ class AlarmHubApiClient:
             f"/v1/alarm-hubs/{hub_id}/outputs/{output_id}/trigger",
             parse_body=False,
             json={"enable": enable},
+        )
+
+    async def async_fire_webhook(self, trigger_id: str) -> None:
+        """Fire an Alarm Manager alarm whose Trigger is Webhook.
+
+        This is how the hub is armed and disarmed under the Global Alarm
+        Manager, where the Integration API will not set the arm profile
+        itself: the alarm is configured in Protect with Action = Arm (a profile)
+        or Disarm, and this call is the thing that trips it. The id is quoted
+        because it is user-typed and lands in a URL path -- a stray ``/`` or
+        ``?`` must not be able to address a different endpoint with the key.
+        """
+        await self._request(
+            "POST",
+            f"/v1/alarm-manager/webhook/{quote(trigger_id, safe='')}",
+            parse_body=False,
         )
 
     async def async_subscribe_devices(

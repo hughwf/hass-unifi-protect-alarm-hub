@@ -26,7 +26,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlowWithReload,
+)
 from homeassistant.const import CONF_API_KEY, CONF_HOST, CONF_PORT, CONF_VERIFY_SSL
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import AbortFlow
@@ -34,7 +39,14 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AlarmHubApiClient, AlarmHubAuthError, AlarmHubConnectionError
-from .const import DEFAULT_PORT, DEFAULT_VERIFY_SSL, DOMAIN
+from .const import (
+    CONF_ARM_AWAY_TRIGGER,
+    CONF_ARM_NIGHT_TRIGGER,
+    CONF_DISARM_TRIGGER,
+    DEFAULT_PORT,
+    DEFAULT_VERIFY_SSL,
+    DOMAIN,
+)
 from .coordinator import hubs_by_id
 from .logic import hub_keys, identity_aliases, mac_key, names_hardware, own_identities
 from .models import AlarmHub
@@ -79,6 +91,56 @@ STEP_USER_SCHEMA = vol.Schema(
 # the entry already points at, and offering the address again would invite
 # someone to move the entry from a dialog that cannot check the move.
 STEP_REAUTH_SCHEMA = vol.Schema({vol.Required(CONF_API_KEY): str})
+
+# All optional: leave every field blank and there is no alarm panel, only the
+# read-only entities. See ``alarm_control_panel``.
+OPTIONS_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_ARM_AWAY_TRIGGER): str,
+        vol.Optional(CONF_ARM_NIGHT_TRIGGER): str,
+        vol.Optional(CONF_DISARM_TRIGGER): str,
+    }
+)
+
+
+class AlarmHubOptionsFlow(OptionsFlowWithReload):
+    """The webhook Trigger IDs that let Home Assistant arm and disarm the hub.
+
+    Options rather than a config step: they are optional, they are edited long
+    after setup, and saving them must not re-run the console checks that
+    ``reconfigure`` does. ``OptionsFlowWithReload`` reloads the entry when they
+    change -- and only then -- which is what makes the panel appear; a general
+    update listener would also fire for the unique-id migration setup performs.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            # A cleared field arrives as "" or not at all; either means "not
+            # configured", and storing "" would only have to be re-checked
+            # everywhere it is read.
+            cleaned = {
+                key: value.strip()
+                for key, value in user_input.items()
+                if isinstance(value, str) and value.strip()
+            }
+            # The same alarm cannot both arm and disarm, and pasting one id into
+            # two fields is the mistake this form invites: it would make "arm"
+            # silently do whatever that alarm does.
+            if len(set(cleaned.values())) != len(cleaned):
+                errors["base"] = "duplicate_trigger"
+            else:
+                return self.async_create_entry(data=cleaned)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                OPTIONS_SCHEMA, user_input or self.config_entry.options
+            ),
+            errors=errors,
+        )
 
 
 def _is_ipv6(host: str) -> bool:
@@ -324,6 +386,11 @@ class AlarmHubConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for UniFi Protect Alarm Hub."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> AlarmHubOptionsFlow:
+        return AlarmHubOptionsFlow()
 
     async def _async_validate(
         self, user_input: Mapping[str, Any]

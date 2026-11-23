@@ -1,8 +1,9 @@
 # UniFi Protect Alarm Hub (Home Assistant)
 
 Exposes a UniFi Protect **Alarm Hub** in Home Assistant — wired input zones as
-`binary_sensor` entities and output channels as `switch` entities — which the
-official `unifiprotect` integration does not create.
+`binary_sensor` entities, output channels as `switch` entities, and (optionally)
+an **alarm control panel** that arms and disarms it — none of which the
+official `unifiprotect` integration creates.
 
 **Self-contained:** this component talks to the UniFi Protect **public
 integration API** directly over its own small HTTP client, with no `uiprotect`
@@ -37,6 +38,46 @@ If the API key is rotated or revoked, Home Assistant offers **Reauthenticate**;
 if the console moves, **Reconfigure** changes its address. Reconfigure refuses a
 console that shares no hardware with the entry, so it cannot silently repoint an
 entry at different hardware and orphan the entities your automations name.
+
+## Arming and disarming (Global Alarm Manager)
+The Alarm Hub forces UniFi's **Global Alarm Manager**, and in that mode the
+Protect API refuses to set the arm profile directly. What it does allow is firing
+an Alarm Manager alarm whose trigger is a **webhook**, so arming from Home
+Assistant works by pointing this integration at alarms you create in Protect:
+
+1. In **Protect → Alarm Manager**, create one alarm per action you want, each with
+   **Trigger = Webhook**:
+   - **Action = Arm**, choosing the profile → your *Away* alarm
+   - **Action = Arm**, choosing a different profile → your *Night* alarm
+   - **Action = Disarm** → your *Disarm* alarm
+2. Copy each alarm's **Trigger ID**.
+3. In Home Assistant: Settings → Devices & Services → UniFi Protect Alarm Hub →
+   **Configure**, and paste each ID into its field. Leave a field blank to omit
+   that action. Saving reloads the integration.
+
+An `alarm_control_panel` entity then appears, offering only the actions you
+configured. With every field blank there is no panel — only the read-only
+entities — because a panel that cannot act would just repeat the *Armed* sensor.
+
+**How it knows Away from Night.** The hub reports *whether* it is armed but not
+*which* profile. It does report, per zone, whether the zone is live under the
+current profile, and Away and Night normally light different zones — so the set
+of live zones identifies the profile. The panel learns each set the first time
+you arm that profile **from Home Assistant**, remembers it across restarts, and
+from then on recognises it however it was armed (fob, keypad, the Protect app).
+Until a profile has been seen, an armed hub reads as *armed away* (or *armed
+night* if Night is the only action you configured).
+
+Things it deliberately does not do:
+- **No `arming`/`pending` state.** Protect does not report an exit delay, so the
+  panel goes from *disarmed* straight to *armed* when the hub says so.
+- **No `triggered` state.** A beeper chirping through an entry delay looks the
+  same as a siren, and a panel that cries "triggered" on every arrival is worse
+  than one that stays quiet. Use the output switches for a real siren.
+- **Away and Night that light identical zones cannot be told apart.** The label
+  is never learned and the default stands.
+- **It cannot check a Trigger ID until you use it.** A wrong ID surfaces as an
+  error on the first arm/disarm attempt, which says to check it.
 
 ## Entities created
 Per adopted alarm hub (grouped under one device):
@@ -119,6 +160,14 @@ logger:
   logs:
     custom_components.unifi_protect_alarm_hub: debug
 ```
+**Arm/disarm fails with "did not accept the webhook".** The Trigger ID does not
+match an Alarm Manager alarm whose trigger is *Webhook*, or the alarm was
+deleted. Re-copy the ID from that alarm in Protect. Two actions cannot share an
+ID, and the options form refuses it.
+
+**The panel says *armed away* when it is armed Night.** That profile has not been
+seen yet: arm Night once from Home Assistant and it is remembered.
+
 If no entities appear, confirm the API key has Protect read access. A console
 with no adopted alarm hub is now refused while adding the integration, and a hub
 adopted afterwards appears on its own.

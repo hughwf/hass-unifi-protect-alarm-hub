@@ -1133,3 +1133,81 @@ async def test_reconfigure_refuses_a_console_another_entry_already_holds(hass):
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "already_configured"
     assert entry.unique_id == LEGACY_ID
+
+
+# --- options: the webhook Trigger IDs ---
+
+
+async def _options(hass, user_input=None, options=None):
+    entry = MockConfigEntry(domain=DOMAIN, data=USER_INPUT, options=options or {})
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    if user_input is not None:
+        with patch(
+            "custom_components.unifi_protect_alarm_hub.async_setup_entry",
+            return_value=True,
+        ):
+            result = await hass.config_entries.options.async_configure(
+                result["flow_id"], user_input
+            )
+    return entry, result
+
+
+def _assert_options_translated(result: dict) -> None:
+    options = TRANSLATIONS["options"]
+    if result["type"] == FlowResultType.FORM:
+        assert result["step_id"] in options["step"]
+        for field in result["data_schema"].schema:
+            assert str(field) in options["step"][result["step_id"]]["data"]
+        for error in (result["errors"] or {}).values():
+            assert error in options["error"]
+
+
+async def test_options_form_offers_the_three_triggers_and_is_translated(hass):
+    _, result = await _options(hass)
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "init"
+    assert {str(f) for f in result["data_schema"].schema} == {
+        "arm_away_trigger_id",
+        "arm_night_trigger_id",
+        "disarm_trigger_id",
+    }
+    _assert_options_translated(result)
+    assert STRINGS["options"] == TRANSLATIONS["options"]
+
+
+async def test_options_form_shows_what_is_already_saved(hass):
+    _, result = await _options(hass, options={"disarm_trigger_id": "d1"})
+    assert _suggested(result)["disarm_trigger_id"] == "d1"
+
+
+async def test_options_save_trimmed_ids_and_drop_blank_ones(hass):
+    entry, result = await _options(
+        hass,
+        {
+            "arm_away_trigger_id": "  a1  ",
+            "arm_night_trigger_id": "",
+            "disarm_trigger_id": "d1",
+        },
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options == {"arm_away_trigger_id": "a1", "disarm_trigger_id": "d1"}
+
+
+async def test_options_can_be_cleared_entirely(hass):
+    """No triggers means no panel, so clearing every field must be saveable."""
+    entry, result = await _options(hass, {}, options={"disarm_trigger_id": "d1"})
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options == {}
+
+
+async def test_options_refuse_one_trigger_id_for_two_actions(hass):
+    """Pasting one id into two fields would make "arm" silently do whatever that
+    alarm does -- disarm, if it is the disarm alarm."""
+    _, result = await _options(
+        hass, {"arm_away_trigger_id": "same", "disarm_trigger_id": "same"}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"base": "duplicate_trigger"}
+    _assert_options_translated(result)
+    assert "duplicate_trigger" in TRANSLATIONS["options"]["error"]

@@ -226,9 +226,15 @@ class InputZone:
     name: str | None
     last_triggered_at: int | None
     camera_id: str | None
+    # Whether the zone is live under the arm profile in force right now. The hub
+    # does not say *which* profile that is, but each profile lights a different
+    # set of zones, so the set is a fingerprint (``logic.profile_fingerprint``).
+    # ``None`` when the console does not send the field at all.
+    triggers_on_current_profile: bool | None = None
 
     @classmethod
     def from_json(cls, zone_id: int, data: dict[str, Any]) -> InputZone:
+        profile = data.get("triggerOnCurrentArmingProfile")
         return cls(
             zone_id=zone_id,
             enable=data.get("enable"),
@@ -238,6 +244,9 @@ class InputZone:
             name=data.get("name"),
             last_triggered_at=data.get("lastTriggeredAt"),
             camera_id=data.get("cameraId"),
+            triggers_on_current_profile=(
+                profile == "on" if profile in ("on", "off") else None
+            ),
         )
 
 
