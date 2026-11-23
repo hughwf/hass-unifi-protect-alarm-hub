@@ -699,6 +699,22 @@ async def test_a_frame_is_logged_before_anything_interprets_it(caplog):
     assert raw in caplog.text
 
 
+async def test_each_model_key_is_logged_once_per_connection(caplog):
+    """Filtered frames leave a trace, so a renamed hub key is visible (#5)."""
+    camera = '{"type": "update", "item": {"id": "c", "modelKey": "camera"}}'
+    hub = '{"type": "update", "item": {"id": "x", "modelKey": "linkstation"}}'
+    session = _WSFakeSession([_text(camera), _text(camera), _text(hub), _text("{")])
+
+    with caplog.at_level(
+        logging.DEBUG, logger="custom_components.unifi_protect_alarm_hub.api"
+    ):
+        await _client(session).async_subscribe_devices(lambda _frame: None)
+
+    assert caplog.text.count("first frame with modelKey='camera'") == 1
+    assert caplog.text.count("first frame with modelKey='linkstation'") == 1
+    assert caplog.text.count("first frame with modelKey=None") == 1
+
+
 async def test_a_snapshot_is_logged_for_the_same_reason(caplog):
     payload = [{"id": "ah1", "mac": "M", "isAlarmHub": True, "alarmHub": {}}]
     client = _client(_FakeSession(_FakeResp(200, payload)))

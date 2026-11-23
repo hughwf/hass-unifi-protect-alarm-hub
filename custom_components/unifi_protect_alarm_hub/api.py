@@ -82,6 +82,20 @@ def alarm_hub_frame(raw: str) -> dict[str, Any] | None:
     return data
 
 
+def frame_model_key(raw: str) -> str | None:
+    """The ``modelKey`` a devices-WS text frame names, or None if it names none.
+
+    Diagnostic only. ``alarm_hub_frame`` drops everything that is not a
+    ``linkstation`` without a word, so a console that renamed the key, or
+    stopped sending hub frames at all, looks exactly like a quiet hub (#5).
+    """
+    try:
+        key = json.loads(raw)["item"]["modelKey"]
+    except (ValueError, TypeError, KeyError):
+        return None
+    return key if isinstance(key, str) else None
+
+
 def ws_close_reason(
     close_code: int | None, exception: BaseException | None
 ) -> str | None:
@@ -266,8 +280,20 @@ class AlarmHubApiClient:
         on_alarm_hub_frame: Callable[[dict[str, Any]], None],
     ) -> None:
         """Drain the socket until it ends, raising unless the end was graceful."""
+        seen_model_keys: set[str | None] = set()
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    # Once per key per connection: which devices this socket
+                    # is talking about, including the ones filtered out below.
+                    model_key = frame_model_key(msg.data)
+                    if model_key not in seen_model_keys:
+                        seen_model_keys.add(model_key)
+                        _LOGGER.debug(
+                            "Devices WebSocket: first frame with modelKey=%r"
+                            " on this connection",
+                            model_key,
+                        )
                 frame = alarm_hub_frame(msg.data)
                 if frame is not None:
                     # Logged before anything interprets it, and this is the line
