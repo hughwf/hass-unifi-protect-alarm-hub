@@ -1211,3 +1211,32 @@ async def test_options_refuse_one_trigger_id_for_two_actions(hass):
     assert result["errors"] == {"base": "duplicate_trigger"}
     _assert_options_translated(result)
     assert "duplicate_trigger" in TRANSLATIONS["options"]["error"]
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "..",  # the URL library resolves this to a different endpoint
+        "https://192.168.1.1/proxy/protect/integration/v1/alarm-manager/webhook/a1",
+        "a1 b2",
+    ],
+)
+async def test_options_refuse_what_is_not_a_trigger_id(hass, typed):
+    """Caught here, on the field, rather than at the door when Disarm fails."""
+    entry, result = await _options(
+        hass, {"arm_away_trigger_id": "a1", "disarm_trigger_id": typed}
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["errors"] == {"disarm_trigger_id": "invalid_trigger"}
+    _assert_options_translated(result)
+    assert entry.options == {}
+
+
+async def test_options_accept_a_real_trigger_id(hass):
+    entry, result = await _options(
+        hass, {"disarm_trigger_id": "2f3be048-ea15-4d90-8109-785006a43da1"}
+    )
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert entry.options == {
+        "disarm_trigger_id": "2f3be048-ea15-4d90-8109-785006a43da1"
+    }

@@ -10,6 +10,7 @@ the hub reports ``armed`` and nothing that tells the two apart.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -18,8 +19,12 @@ from homeassistant.components.alarm_control_panel import (
 )
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.exceptions import HomeAssistantError
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from custom_components.unifi_protect_alarm_hub.alarm_control_panel import ARM_WINDOW
+from custom_components.unifi_protect_alarm_hub.alarm_control_panel import (
+    ARM_WINDOW,
+    SETTLE_DELAYS,
+)
 from custom_components.unifi_protect_alarm_hub.api import (
     AlarmHubAuthError,
     AlarmHubConnectionError,
@@ -36,6 +41,7 @@ from platform_common import (  # noqa: F401  (unload_entries is an autouse fixtu
     hub_json,
     poll,
     restart,
+    restart_unloaded,
     setup_integration,
     unload_entries,
 )
@@ -80,6 +86,16 @@ def _state(hass) -> str:
     return hass.states.get(PANEL).state
 
 
+async def _tick(hass, freezer, seconds: int) -> None:
+    """Let ``seconds`` pass one at a time.
+
+    One at a time because each follow-up read schedules the next only once it
+    has run: a single jump of the clock fires the first and nothing after it.
+    """
+    for _ in range(seconds):
+        await advance(hass, freezer, 1)
+
+
 async def test_no_panel_until_a_webhook_is_configured(hass):
     """Without a Trigger ID the panel could do nothing, and would only duplicate
     the *Armed* binary sensor, so it is not created."""
@@ -103,6 +119,22 @@ async def test_blank_options_are_treated_as_unconfigured(hass):
     """A cleared field must not count as a Trigger ID."""
     await setup_integration(hass, _console(), {CONF_ARM_AWAY_TRIGGER: "  "})
     assert entity_ids(hass, "alarm_control_panel") == []
+
+
+async def test_clearing_every_trigger_removes_the_panel(hass):
+    """Left in the registry it comes back as an Arm button that is unavailable
+    for good, on every dashboard that had it."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    assert hass.states.get(PANEL) is not None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    hass.config_entries.async_update_entry(entry, options={})
+    await restart_unloaded(hass, entry, console)
+    assert hass.states.get(PANEL) is None
+    assert entity_ids(hass, "alarm_control_panel") == []
+    # Only the panel: the read-only entities are untouched.
+    assert entity_ids(hass, "binary_sensor")
 
 
 async def test_disarmed_and_armed_states_come_from_the_hub(hass):
@@ -241,12 +273,140 @@ async def test_a_disarm_the_hub_reports_late_is_seen_without_a_push(hass, freeze
 
 
 async def test_follow_up_reads_stop_once_the_hub_has_answered(hass, freezer):
+    """One read to be sure of it, then no more."""
     console = _console()
     await setup_integration(hass, console, ALL_TRIGGERS)
     await _call(hass, "alarm_arm_night")  # the fake arms at once
     polls = console.polls
-    await advance(hass, freezer, 30)
-    assert console.polls == polls
+    await _tick(hass, freezer, 30)
+    assert console.polls == polls + 1
+
+
+async def test_every_follow_up_read_is_made_and_then_they_stop(hass, freezer):
+    """A hub that never acts is read once per delay and then left to the poll."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # never arms
+    await _call(hass, "alarm_arm_night")
+    polls = console.polls
+    await _tick(hass, freezer, int(sum(SETTLE_DELAYS)) + 30)
+    assert console.polls == polls + len(SETTLE_DELAYS)
+
+
+async def test_an_arm_the_hub_reports_after_the_quick_reads_is_still_seen(
+    hass, freezer
+):
+    """An exit delay or a busy console: armed 16s after the press, with nothing
+    pushed. The panel must not go on saying disarmed until the five-minute
+    poll. Too late to be credited, so it reads as the default profile."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_arm_night")
+    await _tick(hass, freezer, 16)
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])
+    await _tick(hass, freezer, 15)  # the next read is 30s after the press
+    assert _state(hass) == "armed_away"
+
+
+async def test_a_command_is_read_back_even_when_the_cache_already_agrees(hass, freezer):
+    """Arm, disarm, arm again in quick succession: the refreshes after the
+    second and third presses are debounced, so the panel still holds the first
+    arm. That stale "armed" must not be taken for the answer to the third."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_away")
+    await _call(hass, "alarm_disarm")
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_away"  # still the first arm, from the cache
+
+    polls = console.polls
+    await _tick(hass, freezer, 1)
+    assert _state(hass) == "armed_night"
+    # One read, from the last press: the two it superseded have stood down.
+    assert console.polls == polls + 1
+
+
+async def test_a_second_press_does_not_fail_a_read_in_flight(hass, freezer):
+    """The second press takes over from the first one's follow-up. Done by
+    cancelling it, that lands on a read still on the wire, and Home Assistant
+    records the cancellation as a failed update for the whole entry."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    coordinator = entry.runtime_data
+    console.webhook_effects["night-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_arm_night")
+
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow():
+        started.set()
+        await gate.wait()
+        return await console.async_get_alarm_hubs()
+
+    coordinator.client.async_get_alarm_hubs.side_effect = slow
+    freezer.tick(1.1)
+    async_fire_time_changed(hass)
+    await asyncio.wait_for(started.wait(), 1)  # the follow-up read is out
+
+    await hass.services.async_call(
+        "alarm_control_panel", "alarm_disarm", {"entity_id": PANEL}, blocking=True
+    )
+    gate.set()
+    coordinator.client.async_get_alarm_hubs.side_effect = console.async_get_alarm_hubs
+    await hass.async_block_till_done()
+    assert coordinator.last_update_success is True
+
+
+async def test_a_press_during_another_keeps_the_newer_follow_up(hass, freezer):
+    """Disarm, and Arm Night while the disarm's own refresh is still on the
+    wire. The follow-up that goes on reading has to be the arm's: the disarm's
+    would be satisfied by the first "disarmed" and never see the arm land."""
+    console = _console(armed="on")
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    client = entry.runtime_data.client
+    console.webhook_effects["night-id"] = lambda payload: None  # slow to arm
+
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow():
+        started.set()
+        await gate.wait()
+        return await console.async_get_alarm_hubs()
+
+    client.async_get_alarm_hubs.side_effect = slow
+    disarm = hass.async_create_task(
+        hass.services.async_call(
+            "alarm_control_panel", "alarm_disarm", {"entity_id": PANEL}, blocking=True
+        )
+    )
+    await asyncio.wait_for(started.wait(), 1)  # the disarm's refresh is out
+    await hass.services.async_call(
+        "alarm_control_panel", "alarm_arm_night", {"entity_id": PANEL}, blocking=True
+    )
+    gate.set()
+    client.async_get_alarm_hubs.side_effect = console.async_get_alarm_hubs
+    await disarm
+    await _tick(hass, freezer, 2)
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])
+    await _tick(hass, freezer, 6)
+    assert _state(hass) == "armed_night"
+
+
+async def test_a_server_error_is_followed_up_like_no_answer(hass):
+    """A 502 from a console that had already armed the hub."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_error = AlarmHubConnectionError("HTTP 502 from /v1/...", 502)
+    _arm(console.payloads[0])
+    with pytest.raises(HomeAssistantError, match="Could not confirm"):
+        await _call(hass, "alarm_arm_night")
+    await hass.async_block_till_done()
+    assert _state(hass) == "armed_night"
 
 
 async def test_one_command_does_not_label_a_second_spell(hass):
@@ -344,6 +504,22 @@ async def test_a_webhook_the_console_refuses_points_at_the_trigger_id(hass):
     """A wrong Trigger ID is the likeliest mistake; the error should say so."""
     console = _console()
     await setup_integration(hass, console, ALL_TRIGGERS)
-    console.webhook_error = AlarmHubConnectionError("HTTP 404 from /v1/alarm-manager")
+    console.webhook_error = AlarmHubConnectionError(
+        "HTTP 404 from /v1/alarm-manager", 404
+    )
     with pytest.raises(HomeAssistantError, match="Trigger ID"):
         await _call(hass, "alarm_arm_away")
+
+
+async def test_a_console_that_never_answered_is_not_reported_as_a_refusal(hass):
+    """A console that armed the hub and replied too late raises the same error
+    as one that is down. Saying "did not accept the webhook" and walking away
+    would leave the panel on disarmed over an armed house."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_error = AlarmHubConnectionError("Timed out talking to /v1/...")
+    _arm(console.payloads[0])  # it acted all the same
+    with pytest.raises(HomeAssistantError, match="Could not confirm"):
+        await _call(hass, "alarm_arm_night")
+    await hass.async_block_till_done()
+    assert _state(hass) == "armed_night"

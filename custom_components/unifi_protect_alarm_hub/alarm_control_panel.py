@@ -38,8 +38,10 @@ from homeassistant.components.alarm_control_panel import (
     AlarmControlPanelEntityFeature,
     AlarmControlPanelState,
 )
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
@@ -68,13 +70,18 @@ from .models import AlarmHub
 # disarm.
 ARM_WINDOW = 20.0
 
-# Seconds to wait before each follow-up read after a command, for as long as the
-# hub has not reported what was asked for. Arming and disarming send no frame on
-# the devices WebSocket -- six transitions on a real console, none pushed -- so
-# without these the panel sits on the old state until the next SCAN_INTERVAL
-# poll, by which time an arm is outside ARM_WINDOW and goes uncredited. They add
-# up to 15s, inside ARM_WINDOW.
-SETTLE_DELAYS = (1.0, 2.0, 4.0, 8.0)
+# Seconds to wait before each follow-up read after a command, until the hub
+# reports what was asked for. Arming and disarming send no frame on the devices
+# WebSocket -- six transitions on a real console, none pushed -- so without
+# these the panel sits on the old state until the next SCAN_INTERVAL poll.
+#
+# The first four are quick: a real hub answers within a second, and an arm has
+# to be seen inside ARM_WINDOW to be credited. The rest are slow, for a hub that
+# has not answered in 15s and may still act: "disarmed" over an armed house must
+# not stand for five minutes. An arm seen that late reads as the default
+# profile. They add up to five minutes; after the last, the hub is left to the
+# regular poll.
+SETTLE_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0, 60.0, 60.0, 60.0)
 
 _STATES = {
     PROFILE_DISARMED: AlarmControlPanelState.DISARMED,
@@ -119,6 +126,15 @@ async def async_setup_entry(
         for key in (CONF_ARM_AWAY_TRIGGER, CONF_ARM_NIGHT_TRIGGER, CONF_DISARM_TRIGGER)
     }
     if not any(triggers.values()):
+        # Clearing the options takes the panel with it. Everywhere else this
+        # integration leaves entities in place, because one that vanishes takes
+        # its automations along; here the user has removed the only thing the
+        # panel could do, and what stayed behind would be an Arm button that
+        # can never work.
+        registry = er.async_get(hass)
+        for row in er.async_entries_for_config_entry(registry, entry.entry_id):
+            if row.domain == Platform.ALARM_CONTROL_PANEL:
+                registry.async_remove(row.entity_id)
         return
 
     coordinator: AlarmHubCoordinator = entry.runtime_data
@@ -159,7 +175,7 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity, RestoreEnt
         # then a keypad re-arm that lands inside the same window.
         self._armed_as: str | None = None
         self._credited: _Command | None = None
-        self._settle_task: asyncio.Task[None] | None = None
+        self._settle: object | None = None
 
     async def async_added_to_hass(self) -> None:
         """Pick the credited profile back up across a restart or a reload.
@@ -244,7 +260,7 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity, RestoreEnt
         gives: anything else reaches the user as "Unknown error occurred" and
         aborts an automation with a traceback instead of a reason. Nothing is
         claimed about the outcome -- the panel keeps showing what the hub
-        reports, and the refresh below is what fetches it.
+        reports, and the follow-up is what fetches it.
         """
         trigger_id = self._triggers[option]
         if not trigger_id:
@@ -260,35 +276,62 @@ class AlarmHubAlarmPanel(AlarmHubBaseEntity, AlarmControlPanelEntity, RestoreEnt
                 f" ({err}); reconfigure the integration with a valid key"
             ) from err
         except AlarmHubConnectionError as err:
+            if err.status is None or err.status >= 500:
+                # No answer, or a server error, is not a refusal: a console that
+                # acted and then replied too late or fell over looks exactly
+                # like this. Follow up as if it had acted, so the panel catches
+                # up instead of sitting on the old state while the error says
+                # nothing happened.
+                await self._async_follow_up(profile)
+                raise HomeAssistantError(
+                    f"Could not confirm the request to {action}: UniFi Protect"
+                    f" gave no usable answer ({err}). It may still have acted;"
+                    " the panel shows what the hub reports"
+                ) from err
             raise HomeAssistantError(
                 f"Could not {action}: UniFi Protect did not accept the webhook"
                 f" ({err}). Check that the Trigger ID matches an Alarm Manager"
                 " alarm whose Trigger is Webhook"
             ) from err
+        await self._async_follow_up(profile)
+
+    async def _async_follow_up(self, profile: str | None) -> None:
+        """Record the command, then go and see what the hub did with it."""
         # A disarm withdraws any arm still waiting to be credited.
         self._last.command = (
             None
             if profile is None
             else _Command(profile, self.coordinator.hass.loop.time() + ARM_WINDOW)
         )
+        # The newest follow-up is the only one that goes on reading. An older
+        # one is superseded rather than cancelled: a cancellation landing inside
+        # the coordinator's refresh is recorded as a failed update for every
+        # entity of the entry. Claimed before the await below, or a press that
+        # arrives during it would be superseded by this older one.
+        self._settle = mine = object()
         await self.coordinator.async_request_refresh()
-        if self._settle_task is not None:
-            self._settle_task.cancel()
         # A background task of the entry, so unloading cancels it.
-        self._settle_task = self.coordinator.entry.async_create_background_task(
+        self.coordinator.entry.async_create_background_task(
             self.hass,
-            self._async_settle(want_armed=profile is not None),
+            self._async_settle(mine, want_armed=profile is not None),
             name=f"{DOMAIN}_panel_settle",
         )
 
-    async def _async_settle(self, *, want_armed: bool) -> None:
-        """Re-read the hub until it reports what was asked for (see SETTLE_DELAYS)."""
+    async def _async_settle(self, mine: object, *, want_armed: bool) -> None:
+        """Re-read the hub until it reports what was asked for (see SETTLE_DELAYS).
+
+        It reads before it looks: the refresh in ``_async_follow_up`` is
+        debounced, so what is cached may predate the command, and a cache that
+        happens to match already would end this without a single read.
+        """
         for delay in SETTLE_DELAYS:
+            await asyncio.sleep(delay)
+            if self._settle is not mine:
+                return  # a later press has its own follow-up
+            await self.coordinator.async_refresh()
             hub = self.hub
             if hub and logic.armed_is_on(hub.alarm_hub_armed) is want_armed:
                 return
-            await asyncio.sleep(delay)
-            await self.coordinator.async_refresh()
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

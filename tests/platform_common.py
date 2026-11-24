@@ -323,6 +323,14 @@ async def restart(
     await _async_setup(hass, entry, console)
 
 
+async def restart_unloaded(
+    hass: HomeAssistant, entry: MockConfigEntry, console: FakeConsole
+) -> None:
+    """Set up an entry the test has already unloaded, to change it in between."""
+    await hass.async_block_till_done()
+    await _async_setup(hass, entry, console)
+
+
 async def _async_setup(
     hass: HomeAssistant, entry: MockConfigEntry, console: FakeConsole
 ) -> None:

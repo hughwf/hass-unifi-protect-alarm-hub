@@ -92,6 +92,12 @@ STEP_USER_SCHEMA = vol.Schema(
 # someone to move the entry from a dialog that cannot check the move.
 STEP_REAUTH_SCHEMA = vol.Schema({vol.Required(CONF_API_KEY): str})
 
+# What a Trigger ID may be made of. Protect's are UUIDs; this is looser than
+# that on purpose and only turns away what is certainly not one: a pasted
+# Trigger Link, a stray space, or ``..``, which the URL library would resolve
+# to a different endpoint of the console.
+_TRIGGER_ID = re.compile(r"[A-Za-z0-9_-]+")
+
 # All optional: leave every field blank and there is no alarm panel, only the
 # read-only entities. See ``alarm_control_panel``.
 OPTIONS_SCHEMA = vol.Schema(
@@ -129,9 +135,12 @@ class AlarmHubOptionsFlow(OptionsFlowWithReload):
             # The same alarm cannot both arm and disarm, and pasting one id into
             # two fields is the mistake this form invites: it would make "arm"
             # silently do whatever that alarm does.
-            if len(set(cleaned.values())) != len(cleaned):
+            for key, value in cleaned.items():
+                if not _TRIGGER_ID.fullmatch(value):
+                    errors[key] = "invalid_trigger"
+            if not errors and len(set(cleaned.values())) != len(cleaned):
                 errors["base"] = "duplicate_trigger"
-            else:
+            if not errors:
                 return self.async_create_entry(data=cleaned)
 
         return self.async_show_form(

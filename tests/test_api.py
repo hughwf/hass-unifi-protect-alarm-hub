@@ -760,5 +760,31 @@ async def test_fire_webhook_still_reports_a_refusal():
     with pytest.raises(AlarmHubAuthError):
         await _client(_FakeSession(_FakeResp(401))).async_fire_webhook("x")
     # An unknown Trigger ID is a 404: it must fail, not look like an armed hub.
-    with pytest.raises(AlarmHubConnectionError):
+    with pytest.raises(AlarmHubConnectionError) as refused:
         await _client(_FakeSession(_FakeResp(404))).async_fire_webhook("x")
+    assert refused.value.status == 404
+
+
+async def test_no_answer_carries_no_status():
+    """What tells "the console said no" from "the outcome is unknown"."""
+    with pytest.raises(AlarmHubConnectionError) as unanswered:
+        await _client(_FakeSession(exc=TimeoutError())).async_fire_webhook("x")
+    assert unanswered.value.status is None
+
+
+async def test_a_redirect_is_refused_not_followed():
+    """Followed, a redirected POST becomes a GET of some other page, takes the
+    API key with it, and comes back 200 -- a command that looks like it worked."""
+    session = _FakeSession(_FakeResp(302))
+    with pytest.raises(AlarmHubConnectionError) as redirected:
+        await _client(session).async_fire_webhook("x")
+    assert redirected.value.status == 302
+    assert session.calls[-1][2]["allow_redirects"] is False
+
+
+async def test_reads_are_requested_as_they_always_were():
+    """Refusing redirects is for the webhook alone; nothing changes for the
+    requests every existing install already makes."""
+    session = _FakeSession(_FakeResp(200, []))
+    await _client(session).async_get_alarm_hubs()
+    assert "allow_redirects" not in session.calls[-1][2]

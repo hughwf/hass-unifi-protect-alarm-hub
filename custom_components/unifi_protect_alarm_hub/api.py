@@ -138,7 +138,17 @@ class AlarmHubAuthError(Exception):
 
 
 class AlarmHubConnectionError(Exception):
-    """Network failure or non-auth error talking to the console."""
+    """Network failure or non-auth error talking to the console.
+
+    ``status`` is the HTTP status when the console answered with one, and None
+    when it never answered. For a command these are not the same failure: a 4xx
+    is the console saying no, while a 5xx or no answer at all leaves the outcome
+    unknown.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class AlarmHubApiClient:
@@ -172,8 +182,10 @@ class AlarmHubApiClient:
             ) as resp:
                 if resp.status in (401, 403):
                     raise AlarmHubAuthError(f"Auth failed ({resp.status})")
-                if resp.status >= 400:
-                    raise AlarmHubConnectionError(f"HTTP {resp.status} from {path}")
+                if resp.status >= 300:
+                    raise AlarmHubConnectionError(
+                        f"HTTP {resp.status} from {path}", resp.status
+                    )
                 if resp.status == 204 or not parse_body:
                     return None
                 return await resp.json()
@@ -239,11 +251,17 @@ class AlarmHubApiClient:
         or Disarm, and this call is the thing that trips it. The id is quoted
         because it is user-typed and lands in a URL path -- a stray ``/`` or
         ``?`` must not be able to address a different endpoint with the key.
+
+        A redirect is refused, not followed. This API never issues one, so a
+        3xx is something else answering; aiohttp would turn the POST into a GET
+        of wherever it points, carry X-API-KEY along even to another host, and
+        hand back that page's 200 as the command having worked.
         """
         await self._request(
             "POST",
             f"/v1/alarm-manager/webhook/{quote(trigger_id, safe='')}",
             parse_body=False,
+            allow_redirects=False,
         )
 
     async def async_subscribe_devices(

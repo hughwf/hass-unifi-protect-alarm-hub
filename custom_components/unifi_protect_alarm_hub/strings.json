@@ -58,7 +58,8 @@
       }
     },
     "error": {
-      "duplicate_trigger": "Each action needs its own Trigger ID; the same one was entered twice."
+      "duplicate_trigger": "Each action needs its own Trigger ID; the same one was entered twice.",
+      "invalid_trigger": "That is not a Trigger ID. Paste only the ID shown under Trigger ID in the alarm (letters, digits and dashes), not the Trigger Link."
     }
   }
 }
