@@ -798,3 +798,25 @@ def test_hub_device_name_stays_distinct_when_the_console_gave_none(name):
         == "Alarm Hub AABBCCDDEEFF"
     )
     assert logic.hub_device_name(None, "ah1") == "Alarm Hub ah1"
+
+
+# --- arm profile ---
+
+
+def test_arm_profile_disarmed_and_unknown():
+    assert logic.arm_profile(_hub(alarm_hub_armed="off"), None) == "disarmed"
+    # A profile credited earlier does not outlive the hub saying it is disarmed.
+    assert (
+        logic.arm_profile(_hub(alarm_hub_armed="off"), logic.PROFILE_NIGHT)
+        == "disarmed"
+    )
+    # Unknown, not disarmed: a missing field must not read as "the house is safe".
+    assert logic.arm_profile(_hub(alarm_hub_armed=None), None) is None
+    assert logic.arm_profile(_hub(alarm_hub_armed="bogus"), None) is None
+
+
+def test_arm_profile_is_what_was_armed_from_here_else_the_default():
+    hub = _hub(alarm_hub_armed="on")
+    assert logic.arm_profile(hub, logic.PROFILE_NIGHT) == "armed_night"
+    assert logic.arm_profile(hub, None) == "armed_away"
+    assert logic.arm_profile(hub, None, default=logic.PROFILE_NIGHT) == "armed_night"

@@ -170,6 +170,36 @@ def armed_is_on(armed: str | None) -> bool | None:
     return armed == "on"
 
 
+# The arm profiles the alarm panel can name. Plain strings so this module stays
+# free of Home Assistant; the platform maps them onto its own states.
+PROFILE_DISARMED = "disarmed"
+PROFILE_AWAY = "armed_away"
+PROFILE_NIGHT = "armed_night"
+
+
+def arm_profile(
+    hub: AlarmHub, armed_as: str | None, default: str = PROFILE_AWAY
+) -> str | None:
+    """The alarm panel's state for ``hub``: disarmed, or which profile is armed.
+
+    The hub reports *whether* it is armed and nothing about *which* profile, so
+    the profile is ``armed_as`` -- the one Home Assistant itself last armed, if
+    it armed this spell at all -- and ``default`` when the hub was armed from
+    somewhere else. That is a guess, and the caller's docs name it as one; the
+    alternative is no armed state at all for a system that plainly is armed.
+
+    ``None`` when the hub did not say whether it is armed -- unknown, not
+    "disarmed": a panel must not tell someone the house is unarmed on the
+    strength of a field the console left out.
+    """
+    armed = armed_is_on(hub.alarm_hub_armed)
+    if armed is None:
+        return None
+    if not armed:
+        return PROFILE_DISARMED
+    return armed_as or default
+
+
 def cover_is_on(cover: Cover | None) -> bool | None:
     """Whether the tamper cover is open. None when we cannot tell.
 

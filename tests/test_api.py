@@ -725,3 +725,66 @@ async def test_a_snapshot_is_logged_for_the_same_reason(caplog):
         await client.async_get_alarm_hubs()
 
     assert "ah1" in caplog.text
+
+
+# --- async_fire_webhook() ---
+
+
+async def test_fire_webhook_posts_to_the_alarm_manager_endpoint():
+    session = _FakeSession(_FakeResp(200))
+    await _client(session).async_fire_webhook("abc123")
+    method, url, kw = session.calls[-1]
+    assert method == "POST"
+    assert url.endswith("/v1/alarm-manager/webhook/abc123")
+    assert kw["headers"]["X-API-KEY"] == "key"
+
+
+async def test_fire_webhook_quotes_a_user_typed_id():
+    """The id is typed into a form and lands in a URL path. A ``/`` or ``?`` in
+    it must not be able to address another endpoint with the API key."""
+    session = _FakeSession(_FakeResp(200))
+    await _client(session).async_fire_webhook("a/b?c#d")
+    url = session.calls[-1][1]
+    assert url.endswith("/v1/alarm-manager/webhook/a%2Fb%3Fc%23d")
+
+
+async def test_fire_webhook_succeeds_on_a_2xx_with_an_unparseable_body():
+    """The alarm has already fired by the time the body is read."""
+    exc = aiohttp.ContentTypeError(
+        _request_info(), (), status=200, message="unexpected mimetype"
+    )
+    await _client(_FakeSession(_FakeResp(200, json_exc=exc))).async_fire_webhook("x")
+
+
+async def test_fire_webhook_still_reports_a_refusal():
+    with pytest.raises(AlarmHubAuthError):
+        await _client(_FakeSession(_FakeResp(401))).async_fire_webhook("x")
+    # An unknown Trigger ID is a 404: it must fail, not look like an armed hub.
+    with pytest.raises(AlarmHubConnectionError) as refused:
+        await _client(_FakeSession(_FakeResp(404))).async_fire_webhook("x")
+    assert refused.value.status == 404
+
+
+async def test_no_answer_carries_no_status():
+    """What tells "the console said no" from "the outcome is unknown"."""
+    with pytest.raises(AlarmHubConnectionError) as unanswered:
+        await _client(_FakeSession(exc=TimeoutError())).async_fire_webhook("x")
+    assert unanswered.value.status is None
+
+
+async def test_a_redirect_is_refused_not_followed():
+    """Followed, a redirected POST becomes a GET of some other page, takes the
+    API key with it, and comes back 200 -- a command that looks like it worked."""
+    session = _FakeSession(_FakeResp(302))
+    with pytest.raises(AlarmHubConnectionError) as redirected:
+        await _client(session).async_fire_webhook("x")
+    assert redirected.value.status == 302
+    assert session.calls[-1][2]["allow_redirects"] is False
+
+
+async def test_reads_are_requested_as_they_always_were():
+    """Refusing redirects is for the webhook alone; nothing changes for the
+    requests every existing install already makes."""
+    session = _FakeSession(_FakeResp(200, []))
+    await _client(session).async_get_alarm_hubs()
+    assert "allow_redirects" not in session.calls[-1][2]

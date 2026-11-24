@@ -147,6 +147,12 @@ class FakeConsole:
         self.payloads: list[dict[str, Any]] = list(payloads)
         self.triggered: list[tuple[str, int, bool]] = []
         self.trigger_error: Exception | None = None
+        # Alarm Manager webhooks fired, in order, and what each one does to the
+        # hub. ``webhook_effects`` maps a Trigger ID to a function that edits the
+        # hub payload the way the console would (arm, disarm, switch profile).
+        self.webhooks: list[str] = []
+        self.webhook_error: Exception | None = None
+        self.webhook_effects: dict[str, Any] = {}
         self.rest_error: Exception | None = None
         self.polls = 0
         # Whether the relay has moved by the time the next REST answer is built.
@@ -178,13 +184,25 @@ class FakeConsole:
                 outputs = payload["alarmHub"]["output"]
                 outputs[str(output_id)]["active"] = "on" if enable else "off"
 
+    async def async_fire_webhook(self, trigger_id: str) -> None:
+        """Accept a webhook; apply its effect to every hub, if a test defined one."""
+        if self.webhook_error is not None:
+            raise self.webhook_error
+        self.webhooks.append(trigger_id)
+        effect = self.webhook_effects.get(trigger_id)
+        if effect is not None:
+            for payload in self.payloads:
+                effect(payload)
+
     def push(self, frame: dict[str, Any]) -> None:
         """Deliver one devices-WS frame to the coordinator's real callback."""
         assert self._on_frame is not None, "the WebSocket has not subscribed yet"
         self._on_frame(frame)
 
 
-def add_entry(hass: HomeAssistant) -> MockConfigEntry:
+def add_entry(
+    hass: HomeAssistant, options: dict[str, Any] | None = None
+) -> MockConfigEntry:
     """The config entry this integration's tests use, added but not set up.
 
     Split out so a test can put registry rows on it *before* the first setup
@@ -200,6 +218,7 @@ def add_entry(hass: HomeAssistant) -> MockConfigEntry:
             CONF_API_KEY: "k",
             CONF_VERIFY_SSL: False,
         },
+        options=options or {},
     )
     entry.add_to_hass(hass)
     return entry
@@ -213,10 +232,12 @@ async def start(
 
 
 async def setup_integration(
-    hass: HomeAssistant, console: FakeConsole
+    hass: HomeAssistant,
+    console: FakeConsole,
+    options: dict[str, Any] | None = None,
 ) -> MockConfigEntry:
     """Set the integration up against ``console`` and wait for its entities."""
-    entry = add_entry(hass)
+    entry = add_entry(hass, options)
     await _async_setup(hass, entry, console)
     return entry
 
@@ -302,12 +323,21 @@ async def restart(
     await _async_setup(hass, entry, console)
 
 
+async def restart_unloaded(
+    hass: HomeAssistant, entry: MockConfigEntry, console: FakeConsole
+) -> None:
+    """Set up an entry the test has already unloaded, to change it in between."""
+    await hass.async_block_till_done()
+    await _async_setup(hass, entry, console)
+
+
 async def _async_setup(
     hass: HomeAssistant, entry: MockConfigEntry, console: FakeConsole
 ) -> None:
     client = MagicMock()
     client.async_get_alarm_hubs = AsyncMock(side_effect=console.async_get_alarm_hubs)
     client.async_trigger_output = AsyncMock(side_effect=console.async_trigger_output)
+    client.async_fire_webhook = AsyncMock(side_effect=console.async_fire_webhook)
 
     async def _subscribe(on_frame, on_connected=None) -> None:
         console._on_frame = on_frame

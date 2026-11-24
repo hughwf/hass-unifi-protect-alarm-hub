@@ -1,15 +1,16 @@
 # UniFi Protect Alarm Hub (Home Assistant)
 
 Exposes a UniFi Protect **Alarm Hub** in Home Assistant — wired input zones as
-`binary_sensor` entities and output channels as `switch` entities — which the
-official `unifiprotect` integration does not create.
+`binary_sensor` entities, output channels as `switch` entities, and (optionally)
+an **alarm control panel** that arms and disarms it — none of which the
+official `unifiprotect` integration creates.
 
 **Self-contained:** this component talks to the UniFi Protect **public
 integration API** directly over its own small HTTP client, with no `uiprotect`
 dependency. It therefore runs side by side with the official UniFi Protect
 integration without any shared-library version conflict.
 
-> **v0.3 — still being validated against real hardware.** Built against the
+> **v0.4 — still being validated against real hardware.** Built against the
 > documented public alarm-hub API. Please file issues with debug logs.
 
 ## Requirements
@@ -37,6 +38,61 @@ If the API key is rotated or revoked, Home Assistant offers **Reauthenticate**;
 if the console moves, **Reconfigure** changes its address. Reconfigure refuses a
 console that shares no hardware with the entry, so it cannot silently repoint an
 entry at different hardware and orphan the entities your automations name.
+
+## Arming and disarming (Global Alarm Manager)
+The Alarm Hub forces UniFi's **Global Alarm Manager**, and in that mode the
+Protect API refuses to set the arm profile directly. What it does allow is firing
+an Alarm Manager alarm whose trigger is a **webhook**, so arming from Home
+Assistant works by pointing this integration at alarms you create in Protect:
+
+1. In **Protect → Alarm Manager**, create one alarm per action you want, each with
+   **Trigger = Webhook**:
+   - **Action = Arm**, choosing the profile → your *Away* alarm
+   - **Action = Arm**, choosing a different profile → your *Night* alarm
+   - **Action = Disarm** → your *Disarm* alarm
+2. Copy each alarm's **Trigger ID**.
+3. In Home Assistant: Settings → Devices & Services → UniFi Protect Alarm Hub →
+   **Configure**, and paste each ID into its field. Leave a field blank to omit
+   that action. Saving reloads the integration.
+
+An `alarm_control_panel` entity then appears, offering only the actions you
+configured. With every field blank there is no panel — only the read-only
+entities — because a panel that cannot act would just repeat the *Armed* sensor.
+Clearing every field later removes the panel again, along with any name or
+area you gave it.
+
+**Away or Night.** The hub reports *whether* it is armed but not *which*
+profile, so the panel shows the profile **Home Assistant last armed**: press
+*Arm Night* and it reads *armed night* until the hub disarms, across restarts.
+A hub armed from anywhere else (fob, keypad, the Protect app) reads as *armed
+away* (or *armed night* if Night is the only action you configured), whichever
+profile it really is.
+
+Things it deliberately does not do:
+- **No `arming`/`pending` state.** Protect does not report an exit delay, so the
+  panel goes from *disarmed* straight to *armed* when the hub says so.
+- **No `triggered` state.** A beeper chirping through an entry delay looks the
+  same as a siren, and a panel that cries "triggered" on every arrival is worse
+  than one that stays quiet. Use the output switches for a real siren.
+- **Arming or disarming from elsewhere can take up to 5 minutes to show.** The
+  console pushes zone activity but not arm state, so a change made at a keypad
+  or in the Protect app is picked up by the next poll (or the next zone event).
+  Commands sent from Home Assistant are read back within seconds, and the hub
+  is re-checked for five minutes if it is slow to act.
+- **It cannot tell Away from Night when the hub is armed elsewhere.** Measured
+  on real hardware, nothing the hub reports differs between the two.
+- **A webhook that Protect accepts but does not act on can mislabel one arm.** If
+  someone then arms from a keypad within 20 seconds, the panel shows the profile
+  you pressed until the next disarm.
+- **It cannot check that a Trigger ID exists until you use it.** The form turns
+  away anything not shaped like one (a pasted Trigger Link, say), but a mistyped
+  ID surfaces as an error on the first arm/disarm attempt, which says to check
+  it.
+- **Commands are dropped while the panel is unavailable.** Home Assistant does
+  not deliver a service call to an unavailable entity and raises no error, so an
+  automation that arms when everyone leaves does nothing if the hub is
+  disconnected at that moment. Have such an automation check the panel's state
+  afterwards if that matters to you.
 
 ## Entities created
 Per adopted alarm hub (grouped under one device):
@@ -119,6 +175,18 @@ logger:
   logs:
     custom_components.unifi_protect_alarm_hub: debug
 ```
+**Arm/disarm fails with "did not accept the webhook".** The Trigger ID does not
+match an Alarm Manager alarm whose trigger is *Webhook*, or the alarm was
+deleted. Re-copy the ID from that alarm in Protect. Two actions cannot share an
+ID, and the options form refuses it.
+
+**Arm/disarm fails with "could not confirm".** The console gave no answer, or
+a server error. It may still have acted: the panel keeps re-reading the hub and
+shows what it reports, so check it before pressing again.
+
+**The panel says *armed away* when it is armed Night.** It was armed from
+outside Home Assistant, and the hub does not report which profile is in force.
+
 If no entities appear, confirm the API key has Protect read access. A console
 with no adopted alarm hub is now refused while adding the integration, and a hub
 adopted afterwards appears on its own.
@@ -158,7 +226,7 @@ and those have to be deleted by hand.
   the order the console lists them the first time they are seen.
 
 ## Status
-v0.3 — built against the public alarm-hub API and validated against mocked
+v0.4 — built against the public alarm-hub API and validated against mocked
 consoles, including upgrades replayed from the registries earlier releases
 actually wrote. Still wants real-world testing. Please report issues with debug
 logs.

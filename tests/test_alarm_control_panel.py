@@ -1,0 +1,525 @@
+"""Tests for the alarm panel: arming through Alarm Manager webhooks.
+
+The Alarm Hub is stuck in Global Alarm Manager mode, where the API cannot set the
+arm profile, so the panel fires user-configured webhooks and reads the result
+back from the hub. The console here is the fake from ``platform_common`` with
+each webhook given an *effect* -- what the real console would do to the hub.
+Arming Away and arming Night have the same effect on purpose: on real hardware
+the hub reports ``armed`` and nothing that tells the two apart.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+from homeassistant.components.alarm_control_panel import (
+    AlarmControlPanelEntityFeature as Feature,
+)
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.exceptions import HomeAssistantError
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+from custom_components.unifi_protect_alarm_hub.alarm_control_panel import (
+    ARM_WINDOW,
+    SETTLE_DELAYS,
+)
+from custom_components.unifi_protect_alarm_hub.api import (
+    AlarmHubAuthError,
+    AlarmHubConnectionError,
+)
+from custom_components.unifi_protect_alarm_hub.const import (
+    CONF_ARM_AWAY_TRIGGER,
+    CONF_ARM_NIGHT_TRIGGER,
+    CONF_DISARM_TRIGGER,
+)
+from platform_common import (  # noqa: F401  (unload_entries is an autouse fixture)
+    FakeConsole,
+    advance,
+    entity_ids,
+    hub_json,
+    poll,
+    restart,
+    restart_unloaded,
+    setup_integration,
+    unload_entries,
+)
+
+PANEL = "alarm_control_panel.alarm_hub_kit"
+
+ALL_TRIGGERS = {
+    CONF_ARM_AWAY_TRIGGER: "away-id",
+    CONF_ARM_NIGHT_TRIGGER: "night-id",
+    CONF_DISARM_TRIGGER: "disarm-id",
+}
+
+
+def _arm(payload: dict[str, Any]) -> None:
+    payload["alarmHub"]["armed"] = "on"
+
+
+def _disarm(payload: dict[str, Any]) -> None:
+    payload["alarmHub"]["armed"] = "off"
+
+
+def _console(*, armed: str = "off") -> FakeConsole:
+    payload = hub_json()
+    payload["alarmHub"]["armed"] = armed
+    console = FakeConsole(payload)
+    console.webhook_effects = {
+        "away-id": _arm,
+        "night-id": _arm,
+        "disarm-id": _disarm,
+    }
+    return console
+
+
+async def _call(hass, service: str) -> None:
+    await hass.services.async_call(
+        "alarm_control_panel", service, {"entity_id": PANEL}, blocking=True
+    )
+    await hass.async_block_till_done()
+
+
+def _state(hass) -> str:
+    return hass.states.get(PANEL).state
+
+
+async def _tick(hass, freezer, seconds: int) -> None:
+    """Let ``seconds`` pass one at a time.
+
+    One at a time because each follow-up read schedules the next only once it
+    has run: a single jump of the clock fires the first and nothing after it.
+    """
+    for _ in range(seconds):
+        await advance(hass, freezer, 1)
+
+
+async def test_no_panel_until_a_webhook_is_configured(hass):
+    """Without a Trigger ID the panel could do nothing, and would only duplicate
+    the *Armed* binary sensor, so it is not created."""
+    await setup_integration(hass, _console())
+    assert entity_ids(hass, "alarm_control_panel") == []
+
+
+async def test_a_configured_webhook_creates_the_panel(hass):
+    await setup_integration(hass, _console(), ALL_TRIGGERS)
+    assert entity_ids(hass, "alarm_control_panel") == [PANEL]
+
+
+async def test_features_follow_which_webhooks_are_configured(hass):
+    """Only actions this panel can actually perform are offered."""
+    await setup_integration(hass, _console(), {CONF_ARM_NIGHT_TRIGGER: "night-id"})
+    features = hass.states.get(PANEL).attributes["supported_features"]
+    assert features == Feature.ARM_NIGHT
+
+
+async def test_blank_options_are_treated_as_unconfigured(hass):
+    """A cleared field must not count as a Trigger ID."""
+    await setup_integration(hass, _console(), {CONF_ARM_AWAY_TRIGGER: "  "})
+    assert entity_ids(hass, "alarm_control_panel") == []
+
+
+async def test_clearing_every_trigger_removes_the_panel(hass):
+    """Left in the registry it comes back as an Arm button that is unavailable
+    for good, on every dashboard that had it."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    assert hass.states.get(PANEL) is not None
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    hass.config_entries.async_update_entry(entry, options={})
+    await restart_unloaded(hass, entry, console)
+    assert hass.states.get(PANEL) is None
+    assert entity_ids(hass, "alarm_control_panel") == []
+    # Only the panel: the read-only entities are untouched.
+    assert entity_ids(hass, "binary_sensor")
+
+
+async def test_disarmed_and_armed_states_come_from_the_hub(hass):
+    console = _console(armed="off")
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    assert _state(hass) == "disarmed"
+
+    console.payloads[0]["alarmHub"]["armed"] = "on"
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"  # not armed from here: the default
+
+
+async def test_an_armed_field_the_hub_did_not_send_reads_unknown(hass):
+    """Not "disarmed": nobody should be told the house is unarmed because the
+    console left a field out."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    del console.payloads[0]["alarmHub"]["armed"]
+    await poll(hass, entry)
+    assert _state(hass) == STATE_UNKNOWN
+
+
+async def test_the_panel_goes_unavailable_with_the_hub(hass):
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    console.payloads[0]["state"] = "DISCONNECTED"
+    await poll(hass, entry)
+    assert _state(hass) == STATE_UNAVAILABLE
+
+
+async def test_arming_away_fires_its_webhook(hass):
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_away")
+    assert console.webhooks == ["away-id"]
+    assert _state(hass) == "armed_away"
+
+
+async def test_disarming_fires_its_webhook(hass, freezer):
+    console = _console(armed="on")
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_disarm")
+    assert console.webhooks == ["disarm-id"]
+    assert _state(hass) == "disarmed"
+
+
+async def test_the_profile_armed_from_here_is_shown_until_disarmed(hass, freezer):
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_night"
+    await advance(hass, freezer, ARM_WINDOW + 1)
+    await poll(hass, entry)
+    assert _state(hass) == "armed_night"  # the label outlives the window
+
+    _disarm(console.payloads[0])  # at the keypad
+    await poll(hass, entry)
+    assert _state(hass) == "disarmed"
+
+
+async def test_armed_from_elsewhere_reads_as_the_default(hass, freezer):
+    """The hub does not say which profile, so a keypad arm is only "armed"."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+    await _call_disarm_then(hass, freezer, "alarm_arm_night")
+    await advance(hass, freezer, ARM_WINDOW + 1)
+
+    _disarm(console.payloads[0])
+    await poll(hass, entry)
+    _arm(console.payloads[0])  # someone arms at the keypad, long after
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
+
+
+async def _call_disarm_then(hass, freezer, service: str) -> None:
+    """Disarm and arm again, past the refresh cooldown between the two."""
+    await advance(hass, freezer, 11)
+    await _call(hass, "alarm_disarm")
+    await advance(hass, freezer, 11)
+    await _call(hass, service)
+
+
+async def test_switching_profile_from_here_while_armed(hass, freezer):
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_away")
+    assert _state(hass) == "armed_away"
+
+    await advance(hass, freezer, 11)
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_night"
+
+
+async def test_an_arm_that_never_took_effect_stops_waiting(hass, freezer):
+    """A refused arm must not leave the panel waiting to label the next profile
+    someone happens to arm."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # never arms
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "disarmed"
+
+    await advance(hass, freezer, ARM_WINDOW + 1)
+    _arm(console.payloads[0])  # someone arms at the keypad
+    await poll(hass, entry)
+    # Had the Night command still been waiting, this would now read Night.
+    assert _state(hass) == "armed_away"
+
+
+async def test_an_arm_the_hub_reports_late_is_seen_without_a_push(hass, freezer):
+    """Arming sends no WebSocket frame, so the panel has to go back and look:
+    left to the five-minute poll it would read disarmed, then uncredited."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])  # the hub acts a moment later, and pushes nothing
+    await advance(hass, freezer, 2)
+    assert _state(hass) == "armed_night"
+
+
+async def test_a_disarm_the_hub_reports_late_is_seen_without_a_push(hass, freezer):
+    console = _console(armed="on")
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["disarm-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_disarm")
+    assert _state(hass) == "armed_away"
+
+    _disarm(console.payloads[0])
+    await advance(hass, freezer, 2)
+    assert _state(hass) == "disarmed"
+
+
+async def test_follow_up_reads_stop_once_the_hub_has_answered(hass, freezer):
+    """One read to be sure of it, then no more."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")  # the fake arms at once
+    polls = console.polls
+    await _tick(hass, freezer, 30)
+    assert console.polls == polls + 1
+
+
+async def test_every_follow_up_read_is_made_and_then_they_stop(hass, freezer):
+    """A hub that never acts is read once per delay and then left to the poll."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # never arms
+    await _call(hass, "alarm_arm_night")
+    polls = console.polls
+    await _tick(hass, freezer, int(sum(SETTLE_DELAYS)) + 30)
+    assert console.polls == polls + len(SETTLE_DELAYS)
+
+
+async def test_an_arm_the_hub_reports_after_the_quick_reads_is_still_seen(
+    hass, freezer
+):
+    """An exit delay or a busy console: armed 16s after the press, with nothing
+    pushed. The panel must not go on saying disarmed until the five-minute
+    poll. Too late to be credited, so it reads as the default profile."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_arm_night")
+    await _tick(hass, freezer, 16)
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])
+    await _tick(hass, freezer, 15)  # the next read is 30s after the press
+    assert _state(hass) == "armed_away"
+
+
+async def test_a_command_is_read_back_even_when_the_cache_already_agrees(hass, freezer):
+    """Arm, disarm, arm again in quick succession: the refreshes after the
+    second and third presses are debounced, so the panel still holds the first
+    arm. That stale "armed" must not be taken for the answer to the third."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_away")
+    await _call(hass, "alarm_disarm")
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_away"  # still the first arm, from the cache
+
+    polls = console.polls
+    await _tick(hass, freezer, 1)
+    assert _state(hass) == "armed_night"
+    # One read, from the last press: the two it superseded have stood down.
+    assert console.polls == polls + 1
+
+
+async def test_a_second_press_does_not_fail_a_read_in_flight(hass, freezer):
+    """The second press takes over from the first one's follow-up. Done by
+    cancelling it, that lands on a read still on the wire, and Home Assistant
+    records the cancellation as a failed update for the whole entry."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    coordinator = entry.runtime_data
+    console.webhook_effects["night-id"] = lambda payload: None  # not yet
+    await _call(hass, "alarm_arm_night")
+
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow():
+        started.set()
+        await gate.wait()
+        return await console.async_get_alarm_hubs()
+
+    coordinator.client.async_get_alarm_hubs.side_effect = slow
+    freezer.tick(1.1)
+    async_fire_time_changed(hass)
+    await asyncio.wait_for(started.wait(), 1)  # the follow-up read is out
+
+    await hass.services.async_call(
+        "alarm_control_panel", "alarm_disarm", {"entity_id": PANEL}, blocking=True
+    )
+    gate.set()
+    coordinator.client.async_get_alarm_hubs.side_effect = console.async_get_alarm_hubs
+    await hass.async_block_till_done()
+    assert coordinator.last_update_success is True
+
+
+async def test_a_press_during_another_keeps_the_newer_follow_up(hass, freezer):
+    """Disarm, and Arm Night while the disarm's own refresh is still on the
+    wire. The follow-up that goes on reading has to be the arm's: the disarm's
+    would be satisfied by the first "disarmed" and never see the arm land."""
+    console = _console(armed="on")
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    client = entry.runtime_data.client
+    console.webhook_effects["night-id"] = lambda payload: None  # slow to arm
+
+    started, gate = asyncio.Event(), asyncio.Event()
+
+    async def slow():
+        started.set()
+        await gate.wait()
+        return await console.async_get_alarm_hubs()
+
+    client.async_get_alarm_hubs.side_effect = slow
+    disarm = hass.async_create_task(
+        hass.services.async_call(
+            "alarm_control_panel", "alarm_disarm", {"entity_id": PANEL}, blocking=True
+        )
+    )
+    await asyncio.wait_for(started.wait(), 1)  # the disarm's refresh is out
+    await hass.services.async_call(
+        "alarm_control_panel", "alarm_arm_night", {"entity_id": PANEL}, blocking=True
+    )
+    gate.set()
+    client.async_get_alarm_hubs.side_effect = console.async_get_alarm_hubs
+    await disarm
+    await _tick(hass, freezer, 2)
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])
+    await _tick(hass, freezer, 6)
+    assert _state(hass) == "armed_night"
+
+
+async def test_a_server_error_is_followed_up_like_no_answer(hass):
+    """A 502 from a console that had already armed the hub."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_error = AlarmHubConnectionError("HTTP 502 from /v1/...", 502)
+    _arm(console.payloads[0])
+    with pytest.raises(HomeAssistantError, match="Could not confirm"):
+        await _call(hass, "alarm_arm_night")
+    await hass.async_block_till_done()
+    assert _state(hass) == "armed_night"
+
+
+async def test_one_command_does_not_label_a_second_spell(hass):
+    """Armed Night from here, then disarmed and re-armed at the keypad while the
+    window is still open: the second arm is not ours."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_night"
+
+    _disarm(console.payloads[0])
+    await poll(hass, entry)
+    _arm(console.payloads[0])
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
+
+
+async def test_a_disarm_withdraws_an_arm_still_waiting(hass, freezer):
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_effects["night-id"] = lambda payload: None  # slow to act
+    await _call(hass, "alarm_arm_night")
+    await advance(hass, freezer, 11)
+    await _call(hass, "alarm_disarm")
+
+    _arm(console.payloads[0])  # armed at the keypad, inside the old window
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
+
+
+async def test_every_hub_credits_the_same_command(hass):
+    """The Alarm Manager arms every hub at once; the panel beside the one that
+    was pressed must not read Away while its neighbour reads Night."""
+    second = hub_json("ah2", mac="112233445566", name="Second Hub")
+    second["alarmHub"]["armed"] = "off"
+    console = _console()
+    console.payloads.append(second)
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    panels = entity_ids(hass, "alarm_control_panel")
+    assert len(panels) == 2
+
+    await _call(hass, "alarm_arm_night")
+    assert {hass.states.get(panel).state for panel in panels} == {"armed_night"}
+
+
+async def test_the_credited_profile_survives_a_restart(hass):
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+    assert _state(hass) == "armed_night"
+
+    await restart(hass, entry, console)
+    assert _state(hass) == "armed_night"  # not back to the Away default
+
+
+async def test_a_restored_profile_does_not_outlive_a_disarm_it_missed(hass):
+    """Disarmed while Home Assistant was down: the old label must not be waiting
+    for whoever arms next."""
+    console = _console()
+    entry = await setup_integration(hass, console, ALL_TRIGGERS)
+    await _call(hass, "alarm_arm_night")
+
+    _disarm(console.payloads[0])
+    await restart(hass, entry, console)
+    assert _state(hass) == "disarmed"
+
+    _arm(console.payloads[0])
+    await poll(hass, entry)
+    assert _state(hass) == "armed_away"
+
+
+async def test_only_night_configured_defaults_an_unknown_profile_to_night(hass):
+    """Calling it Away would name a mode this panel cannot even command."""
+    console = _console(armed="on")
+    await setup_integration(hass, console, {CONF_ARM_NIGHT_TRIGGER: "night-id"})
+    assert _state(hass) == "armed_night"
+
+
+async def test_an_unconfigured_action_says_so(hass):
+    await setup_integration(hass, _console(), {CONF_ARM_AWAY_TRIGGER: "away-id"})
+    with pytest.raises(HomeAssistantError, match="disarm"):
+        await _call(hass, "alarm_disarm")
+
+
+async def test_a_rejected_key_is_reported_not_swallowed(hass):
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_error = AlarmHubAuthError("Auth failed (401)")
+    with pytest.raises(HomeAssistantError, match="rejected the API key"):
+        await _call(hass, "alarm_arm_away")
+    assert console.webhooks == []
+
+
+async def test_a_webhook_the_console_refuses_points_at_the_trigger_id(hass):
+    """A wrong Trigger ID is the likeliest mistake; the error should say so."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_error = AlarmHubConnectionError(
+        "HTTP 404 from /v1/alarm-manager", 404
+    )
+    with pytest.raises(HomeAssistantError, match="Trigger ID"):
+        await _call(hass, "alarm_arm_away")
+
+
+async def test_a_console_that_never_answered_is_not_reported_as_a_refusal(hass):
+    """A console that armed the hub and replied too late raises the same error
+    as one that is down. Saying "did not accept the webhook" and walking away
+    would leave the panel on disarmed over an armed house."""
+    console = _console()
+    await setup_integration(hass, console, ALL_TRIGGERS)
+    console.webhook_error = AlarmHubConnectionError("Timed out talking to /v1/...")
+    _arm(console.payloads[0])  # it acted all the same
+    with pytest.raises(HomeAssistantError, match="Could not confirm"):
+        await _call(hass, "alarm_arm_night")
+    await hass.async_block_till_done()
+    assert _state(hass) == "armed_night"
